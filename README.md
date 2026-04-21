@@ -34,8 +34,50 @@ Pin proposti per `LOLIN D32 Pro`:
 - `GPIO25`: PWM gate MOSFET Peltier
 - `GPIO34`: ADC NTC freddo 10K B3950
 - `GPIO35`: ADC NTC caldo opzionale 10K B3950
+- `GPIO32`: ADC sensore corrente ACS71x quando si usa ADC interno ESP32
 - `GPIO21`: SDA I2C
 - `GPIO22`: SCL I2C
+
+## Selezione hardware in PlatformIO
+
+Il progetto ora prevede piu combinazioni selezionabili prima della compilazione e dell'upload, cambiando environment in `platformio.ini`.
+
+Environment disponibili:
+
+- `lolin_d32_pro_espadc_ina219`
+- `lolin_d32_pro_espadc_acs71x`
+- `lolin_d32_pro_ads1115_ina219`
+- `lolin_d32_pro_ads1115_acs71x`
+
+Significato:
+
+- `espadc`: NTC e ingressi analogici letti dall'ADC interno ESP32
+- `ads1115`: NTC e ingressi analogici letti tramite ADC I2C esterno ADS1115
+- `ina219`: corrente letta via INA219 su I2C
+- `acs71x`: corrente letta con sensore Hall analogico tipo ACS71x
+
+Nota importante:
+
+- se usi `ADS1115 + ACS71x`, tutte le letture analogiche del progetto passano da ADS1115
+- quindi NTC freddo, NTC caldo e sensore corrente ACS71x vengono tutti letti dal convertitore I2C
+- se usi `ADS1115 + INA219`, ADS1115 legge solo le sonde NTC, mentre la corrente resta letta da INA219
+
+### Valori tipici ACS71x
+
+Per i sensori Hall analogici della famiglia ACS71x il parametro chiave e la sensibilita in `mV/A`.
+
+Valori tipici da usare come punto di partenza:
+
+- circa `185.0 mV/A` per modelli intorno a `5 A`
+- circa `100.0 mV/A` per modelli intorno a `20 A`
+- circa `66.0 mV/A` per modelli intorno a `30 A`
+
+Nel file `platformio.ini` puoi regolare:
+
+- `ACS_CURRENT_SENS_MV_PER_A`
+- `ACS_ZERO_V`
+
+In molti moduli analogici alimentati a `3.3V`, `ACS_ZERO_V` puo partire da circa `1.65V`, ma conviene sempre rifinirlo con calibrazione reale a corrente zero.
 
 ## Assunzioni hardware
 
