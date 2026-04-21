@@ -49,6 +49,12 @@ Environment disponibili:
 - `lolin_d32_pro_ads1115_ina219`
 - `lolin_d32_pro_ads1115_acs71x`
 
+Configurazione consigliata di default per partire:
+
+- `lolin_d32_pro_espadc_ina219`
+
+Questa e anche la configurazione attualmente impostata come `default_envs` nel progetto.
+
 Significato:
 
 - `espadc`: NTC e ingressi analogici letti dall'ADC interno ESP32
