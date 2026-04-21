@@ -161,7 +161,7 @@ constexpr char BLE_TARGET_UUID[] = "9b220203-35ac-4e4e-9f6f-8ed48fc5c001";
 constexpr char BLE_PRESET_UUID[] = "9b220204-35ac-4e4e-9f6f-8ed48fc5c001";
 constexpr char BLE_TUNE_UUID[] = "9b220205-35ac-4e4e-9f6f-8ed48fc5c001";
 constexpr char FW_VERSION[] = "0.1.0-dev";
-constexpr char PROJECT_URL[] = "https://github.com/";
+constexpr char PROJECT_URL[] = "https://github.com/naamah75/asi-smart-cooler-diy";
 
 const char* const PRESET_ESTATE = "estate";
 const char* const PRESET_INVERNO = "inverno";
