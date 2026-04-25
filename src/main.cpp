@@ -3,13 +3,23 @@
 #include <Adafruit_ADS1X15.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_INA219.h>
+#if BOARD_LOLIN_S2_PICO
+#include <Adafruit_SSD1306.h>
+#endif
 #include <DNSServer.h>
+#ifndef ENABLE_BLE
+#define ENABLE_BLE 1
+#endif
+
+#if ENABLE_BLE
 #include <NimBLEDevice.h>
+#endif
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <driver/adc.h>
 #include <time.h>
 
 #if __has_include("secrets.h")
@@ -34,13 +44,54 @@
 #define ACS_ZERO_V 1.65f
 #endif
 
+#ifndef THEME_RETRO_AMBER
+#define THEME_RETRO_AMBER 1
+#endif
+
+#ifndef NTC_ADC_FULL_SCALE_V
+#if CONFIG_IDF_TARGET_ESP32S2
+#define NTC_ADC_FULL_SCALE_V 2.5f
+#else
+#define NTC_ADC_FULL_SCALE_V 3.3f
+#endif
+#endif
+
+#ifndef NTC_SERIES_RESISTOR_OHM
+#define NTC_SERIES_RESISTOR_OHM 10000.0f
+#endif
+
+#ifndef NTC_SUPPLY_VOLTAGE
+#define NTC_SUPPLY_VOLTAGE 3.3f
+#endif
+
+#ifndef NTC_COLD_TEMP_OFFSET_C
+#define NTC_COLD_TEMP_OFFSET_C 0.0f
+#endif
+
+#ifndef NTC_HOT_TEMP_OFFSET_C
+#define NTC_HOT_TEMP_OFFSET_C 0.0f
+#endif
+
 namespace pins {
+#if BOARD_LOLIN_S2_PICO
+constexpr uint8_t PELTIER_PWM = 11;
+constexpr uint8_t STATUS_LED = 10;
+constexpr uint8_t COLD_NTC_ADC = 1;
+constexpr uint8_t HOT_NTC_ADC = 2;
+constexpr uint8_t CURRENT_ADC = 3;
+constexpr uint8_t I2C_SDA = 8;
+constexpr uint8_t I2C_SCL = 9;
+constexpr uint8_t OLED_RESET = 18;
+#else
 constexpr uint8_t PELTIER_PWM = 25;
-constexpr uint8_t COLD_NTC_ADC = 34;
-constexpr uint8_t HOT_NTC_ADC = 35;
+constexpr uint8_t STATUS_LED = 5;
+constexpr uint8_t COLD_NTC_ADC = 33;
+constexpr uint8_t HOT_NTC_ADC = 36;
 constexpr uint8_t CURRENT_ADC = 32;
 constexpr uint8_t I2C_SDA = 21;
 constexpr uint8_t I2C_SCL = 22;
+constexpr uint8_t OLED_RESET = 255;
+#endif
 }  // namespace pins
 
 namespace ads_channels {
@@ -65,8 +116,8 @@ constexpr uint32_t SERIAL_LOG_MS = 5000;
 }  // namespace timing
 
 struct Calibration {
-  float coldOffsetC = 0.0f;
-  float hotOffsetC = 0.0f;
+  float coldOffsetC = NTC_COLD_TEMP_OFFSET_C;
+  float hotOffsetC = NTC_HOT_TEMP_OFFSET_C;
   float ambientTempOffsetC = 0.0f;
   float humidityOffsetPct = 0.0f;
   float currentOffsetA = 0.0f;
@@ -89,11 +140,11 @@ struct ControlConfig {
 };
 
 struct ThermistorConfig {
-  float seriesResistorOhm = 10000.0f;
+  float seriesResistorOhm = NTC_SERIES_RESISTOR_OHM;
   float nominalResistanceOhm = 10000.0f;
   float nominalTempC = 25.0f;
   float beta = 3950.0f;
-  float supplyVoltage = 3.3f;
+  float supplyVoltage = NTC_SUPPLY_VOLTAGE;
 };
 
 struct CurrentSensorConfig {
@@ -128,6 +179,21 @@ struct SensorState {
   float dewPointC = NAN;
   float currentA = NAN;
   float busVoltageV = NAN;
+  float coldNtcVoltageV = NAN;
+  float hotNtcVoltageV = NAN;
+  float coldNtcResistanceOhm = NAN;
+  float hotNtcResistanceOhm = NAN;
+  uint16_t coldNtcRaw = 0;
+  uint16_t hotNtcRaw = 0;
+  uint16_t adc32Raw = 0;
+  uint16_t adc33Raw = 0;
+  uint16_t adc34Raw = 0;
+  uint16_t adc32IdfRaw = 0;
+  uint16_t adc33IdfRaw = 0;
+  uint16_t adc34IdfRaw = 0;
+  float adc32VoltageV = NAN;
+  float adc33VoltageV = NAN;
+  float adc34VoltageV = NAN;
   bool bmeOk = false;
   bool inaOk = false;
   bool adsOk = false;
@@ -162,8 +228,12 @@ Preferences preferences;
 Adafruit_BME280 bme;
 Adafruit_INA219 ina219;
 Adafruit_ADS1115 ads;
+#if BOARD_LOLIN_S2_PICO
+Adafruit_SSD1306 display(128, 32, &Wire, pins::OLED_RESET);
+#endif
 WebServer server(80);
 DNSServer dnsServer;
+#if ENABLE_BLE
 NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* bleStatusCharacteristic = nullptr;
 NimBLECharacteristic* bleCommandCharacteristic = nullptr;
@@ -172,21 +242,33 @@ NimBLECharacteristic* bleEnabledCharacteristic = nullptr;
 NimBLECharacteristic* bleTargetCharacteristic = nullptr;
 NimBLECharacteristic* blePresetCharacteristic = nullptr;
 NimBLECharacteristic* bleTuneCharacteristic = nullptr;
+#endif
 
 uint32_t lastSensorMs = 0;
 uint32_t lastControlMs = 0;
 uint32_t lastWifiAttemptMs = 0;
 uint32_t lastBleNotifyMs = 0;
 uint32_t lastSerialLogMs = 0;
+uint32_t lastLedToggleMs = 0;
 float pidIntegral = 0.0f;
 float pidLastError = 0.0f;
 bool pidHasHistory = false;
 bool mdnsStarted = false;
 bool captivePortalActive = false;
 bool ntpConfigured = false;
+bool bmePresent = false;
+bool ina219Present = false;
+bool wifiConnectedLogged = false;
+bool statusLedOn = false;
 time_t bootEpoch = 0;
 
+void writeStatusLed(const bool on) {
+  statusLedOn = on;
+  digitalWrite(pins::STATUS_LED, on ? LOW : HIGH);
+}
+
 constexpr char PREF_NAMESPACE[] = "cooler";
+#if ENABLE_BLE
 constexpr char BLE_SERVICE_UUID[] = "9b220100-35ac-4e4e-9f6f-8ed48fc5c001";
 constexpr char BLE_STATUS_UUID[] = "9b220101-35ac-4e4e-9f6f-8ed48fc5c001";
 constexpr char BLE_COMMAND_UUID[] = "9b220102-35ac-4e4e-9f6f-8ed48fc5c001";
@@ -196,6 +278,7 @@ constexpr char BLE_ENABLE_UUID[] = "9b220202-35ac-4e4e-9f6f-8ed48fc5c001";
 constexpr char BLE_TARGET_UUID[] = "9b220203-35ac-4e4e-9f6f-8ed48fc5c001";
 constexpr char BLE_PRESET_UUID[] = "9b220204-35ac-4e4e-9f6f-8ed48fc5c001";
 constexpr char BLE_TUNE_UUID[] = "9b220205-35ac-4e4e-9f6f-8ed48fc5c001";
+#endif
 constexpr char FW_VERSION[] = "0.1.0-dev";
 constexpr char PROJECT_URL[] = "https://github.com/naamah75/asi-smart-cooler-diy";
 
@@ -259,8 +342,25 @@ bool hasWifiCredentials() {
   return !networkConfig.wifiSsid.isEmpty();
 }
 
+void scanI2cBus() {
+  Serial.println("Scan I2C iniziale...");
+  uint8_t found = 0;
+  for (uint8_t address = 1; address < 127; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  I2C trovato: 0x%02X\n", address);
+      ++found;
+    }
+    delay(2);
+  }
+  if (found == 0) {
+    Serial.println("  Nessuna periferica I2C rilevata");
+  }
+}
+
 float readEspAnalogVoltageV(const uint8_t pin) {
   constexpr size_t sampleCount = 16;
+#if CONFIG_IDF_TARGET_ESP32S2
   uint32_t mvSum = 0;
 
   for (size_t i = 0; i < sampleCount; ++i) {
@@ -268,8 +368,46 @@ float readEspAnalogVoltageV(const uint8_t pin) {
     delay(2);
   }
 
-  const float millivolts = static_cast<float>(mvSum) / static_cast<float>(sampleCount);
-  return millivolts / 1000.0f;
+  return (static_cast<float>(mvSum) / static_cast<float>(sampleCount)) / 1000.0f;
+#else
+  uint32_t rawSum = 0;
+
+  for (size_t i = 0; i < sampleCount; ++i) {
+    rawSum += analogRead(pin);
+    delay(2);
+  }
+
+  const float raw = static_cast<float>(rawSum) / static_cast<float>(sampleCount);
+  return (raw / 4095.0f) * thermistorConfig.supplyVoltage;
+#endif
+}
+
+float espRawToVoltageV(const uint16_t raw) {
+  return (static_cast<float>(raw) / 4095.0f) * NTC_ADC_FULL_SCALE_V;
+}
+
+uint16_t readEspAnalogRaw(const uint8_t pin) {
+  constexpr size_t sampleCount = 16;
+  uint32_t rawSum = 0;
+
+  for (size_t i = 0; i < sampleCount; ++i) {
+    rawSum += analogRead(pin);
+    delay(2);
+  }
+
+  return static_cast<uint16_t>(roundf(static_cast<float>(rawSum) / static_cast<float>(sampleCount)));
+}
+
+uint16_t readAdc1Raw(const adc1_channel_t channel) {
+  constexpr size_t sampleCount = 16;
+  int rawSum = 0;
+
+  for (size_t i = 0; i < sampleCount; ++i) {
+    rawSum += adc1_get_raw(channel);
+    delay(2);
+  }
+
+  return static_cast<uint16_t>(roundf(static_cast<float>(rawSum) / static_cast<float>(sampleCount)));
 }
 
 float readAdsAnalogVoltageV(const uint8_t channel) {
@@ -309,6 +447,14 @@ float thermistorTemperatureFromVoltageC(const float voltage) {
                           (1.0f / thermistorConfig.beta) *
                               logf(resistance / thermistorConfig.nominalResistanceOhm);
   return (1.0f / steinhart) - 273.15f;
+}
+
+float thermistorResistanceFromVoltageOhm(const float voltage) {
+  if (voltage <= 0.001f || voltage >= thermistorConfig.supplyVoltage - 0.001f) {
+    return NAN;
+  }
+  return thermistorConfig.seriesResistorOhm * voltage /
+         (thermistorConfig.supplyVoltage - voltage);
 }
 
 float readThermistorTemperatureC(const uint8_t source) {
@@ -530,32 +676,53 @@ void savePreferences() {
 }
 
 void refreshSensors() {
-  const float coldNtcC = readThermistorTemperatureC(
-#if USE_ADS1115
-      ads_channels::COLD_NTC
-#else
-      pins::COLD_NTC_ADC
+#if !USE_ADS1115
+  sensorState.adc32Raw = readEspAnalogRaw(pins::CURRENT_ADC);
+  sensorState.adc33Raw = readEspAnalogRaw(pins::COLD_NTC_ADC);
+  sensorState.adc34Raw = readEspAnalogRaw(pins::HOT_NTC_ADC);
+#if CONFIG_IDF_TARGET_ESP32
+  sensorState.adc32IdfRaw = readAdc1Raw(ADC1_CHANNEL_4);
+  sensorState.adc33IdfRaw = readAdc1Raw(ADC1_CHANNEL_5);
+  sensorState.adc34IdfRaw = readAdc1Raw(ADC1_CHANNEL_0);
 #endif
+  sensorState.adc32VoltageV = espRawToVoltageV(sensorState.adc32Raw);
+  sensorState.adc33VoltageV = espRawToVoltageV(sensorState.adc33Raw);
+  sensorState.adc34VoltageV = espRawToVoltageV(sensorState.adc34Raw);
+  sensorState.coldNtcRaw = readEspAnalogRaw(pins::COLD_NTC_ADC);
+  sensorState.hotNtcRaw = readEspAnalogRaw(pins::HOT_NTC_ADC);
+  sensorState.coldNtcVoltageV = espRawToVoltageV(sensorState.coldNtcRaw);
+  sensorState.hotNtcVoltageV = espRawToVoltageV(sensorState.hotNtcRaw);
+#else
+  sensorState.coldNtcVoltageV = readAnalogVoltageV(
+      ads_channels::COLD_NTC
   );
+  sensorState.hotNtcVoltageV = readAnalogVoltageV(
+      ads_channels::HOT_NTC
+  );
+#endif
+  sensorState.coldNtcResistanceOhm = thermistorResistanceFromVoltageOhm(sensorState.coldNtcVoltageV);
+  const float coldNtcC = thermistorTemperatureFromVoltageC(sensorState.coldNtcVoltageV);
   sensorState.coldNtcOk = !isnan(coldNtcC);
   sensorState.coldC = sensorState.coldNtcOk ? coldNtcC + calibration.coldOffsetC : NAN;
 
-  const float hotNtcC = readThermistorTemperatureC(
-#if USE_ADS1115
-      ads_channels::HOT_NTC
-#else
-      pins::HOT_NTC_ADC
-#endif
-  );
+  sensorState.hotNtcResistanceOhm = thermistorResistanceFromVoltageOhm(sensorState.hotNtcVoltageV);
+  const float hotNtcC = thermistorTemperatureFromVoltageC(sensorState.hotNtcVoltageV);
   sensorState.hotNtcOk = !isnan(hotNtcC);
   sensorState.hotC = sensorState.hotNtcOk ? hotNtcC + calibration.hotOffsetC : NAN;
 
-  const float ambientC = bme.readTemperature();
-  const float humidity = bme.readHumidity();
-  sensorState.bmeOk = isfinite(ambientC) && isfinite(humidity) && humidity >= 0.0f && humidity <= 100.0f;
-  sensorState.ambientC = sensorState.bmeOk ? ambientC + calibration.ambientTempOffsetC : NAN;
-  sensorState.humidityPct = sensorState.bmeOk ? clampf(humidity + calibration.humidityOffsetPct, 0.0f, 100.0f) : NAN;
-  sensorState.dewPointC = sensorState.bmeOk ? computeDewPointC(sensorState.ambientC, sensorState.humidityPct) : NAN;
+  if (bmePresent) {
+    const float ambientC = bme.readTemperature();
+    const float humidity = bme.readHumidity();
+    sensorState.bmeOk = isfinite(ambientC) && isfinite(humidity) && humidity >= 0.0f && humidity <= 100.0f;
+    sensorState.ambientC = sensorState.bmeOk ? ambientC + calibration.ambientTempOffsetC : NAN;
+    sensorState.humidityPct = sensorState.bmeOk ? clampf(humidity + calibration.humidityOffsetPct, 0.0f, 100.0f) : NAN;
+    sensorState.dewPointC = sensorState.bmeOk ? computeDewPointC(sensorState.ambientC, sensorState.humidityPct) : NAN;
+  } else {
+    sensorState.bmeOk = false;
+    sensorState.ambientC = NAN;
+    sensorState.humidityPct = NAN;
+    sensorState.dewPointC = NAN;
+  }
 
 #if USE_ACS71X_CURRENT
   const float currentVoltage = readAnalogVoltageV(
@@ -576,12 +743,19 @@ void refreshSensors() {
   }
   sensorState.busVoltageV = NAN;
 #else
-  const float currentA = ina219.getCurrent_mA() / 1000.0f;
-  const float busVoltage = ina219.getBusVoltage_V();
-  sensorState.inaOk = isfinite(currentA) && isfinite(busVoltage);
-  sensorState.currentOk = sensorState.inaOk;
-  sensorState.currentA = sensorState.inaOk ? (currentA * calibration.currentScale) + calibration.currentOffsetA : NAN;
-  sensorState.busVoltageV = sensorState.inaOk ? busVoltage : NAN;
+  if (ina219Present) {
+    const float currentA = ina219.getCurrent_mA() / 1000.0f;
+    const float busVoltage = ina219.getBusVoltage_V();
+    sensorState.inaOk = isfinite(currentA) && isfinite(busVoltage);
+    sensorState.currentOk = sensorState.inaOk;
+    sensorState.currentA = sensorState.inaOk ? (currentA * calibration.currentScale) + calibration.currentOffsetA : NAN;
+    sensorState.busVoltageV = sensorState.inaOk ? busVoltage : NAN;
+  } else {
+    sensorState.inaOk = false;
+    sensorState.currentOk = false;
+    sensorState.currentA = NAN;
+    sensorState.busVoltageV = NAN;
+  }
 #endif
 }
 
@@ -638,6 +812,21 @@ void appendStatusJson(JsonDocument& doc) {
   sensor["dew_point_c"] = sensorState.dewPointC;
   sensor["current_a"] = sensorState.currentA;
   sensor["bus_voltage_v"] = sensorState.busVoltageV;
+  sensor["cold_ntc_voltage_v"] = sensorState.coldNtcVoltageV;
+  sensor["hot_ntc_voltage_v"] = sensorState.hotNtcVoltageV;
+  sensor["cold_ntc_ohm"] = sensorState.coldNtcResistanceOhm;
+  sensor["hot_ntc_ohm"] = sensorState.hotNtcResistanceOhm;
+  sensor["cold_ntc_raw"] = sensorState.coldNtcRaw;
+  sensor["hot_ntc_raw"] = sensorState.hotNtcRaw;
+  sensor["adc32_raw"] = sensorState.adc32Raw;
+  sensor["adc33_raw"] = sensorState.adc33Raw;
+  sensor["adc34_raw"] = sensorState.adc34Raw;
+  sensor["adc32_idf_raw"] = sensorState.adc32IdfRaw;
+  sensor["adc33_idf_raw"] = sensorState.adc33IdfRaw;
+  sensor["adc34_idf_raw"] = sensorState.adc34IdfRaw;
+  sensor["adc32_voltage_v"] = sensorState.adc32VoltageV;
+  sensor["adc33_voltage_v"] = sensorState.adc33VoltageV;
+  sensor["adc34_voltage_v"] = sensorState.adc34VoltageV;
   sensor["cold_ntc_ok"] = sensorState.coldNtcOk;
   sensor["hot_ntc_ok"] = sensorState.hotNtcOk;
   sensor["bme280_ok"] = sensorState.bmeOk;
@@ -677,6 +866,7 @@ void appendStatusJson(JsonDocument& doc) {
   network["wifi_connected"] = WiFi.isConnected();
   network["ip"] = WiFi.isConnected() ? WiFi.localIP().toString() : String();
   network["hostname"] = networkConfig.hostname;
+  network["mdns_url"] = mdnsStarted ? String("http://") + networkConfig.hostname + ".local/" : String();
   network["ble_name"] = networkConfig.hostname;
   network["wifi_ssid"] = networkConfig.wifiSsid;
   network["dhcp_enabled"] = networkConfig.dhcpEnabled;
@@ -696,8 +886,13 @@ void appendStatusJson(JsonDocument& doc) {
   board["free_heap_bytes"] = ESP.getFreeHeap();
   board["wifi_rssi_dbm"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
   board["wifi_bssid"] = WiFi.isConnected() ? WiFi.BSSIDstr() : String();
+  #if ENABLE_BLE
   board["ble_connected"] = bleServer != nullptr ? bleServer->getConnectedCount() > 0 : false;
   board["ble_clients"] = bleServer != nullptr ? bleServer->getConnectedCount() : 0;
+  #else
+  board["ble_connected"] = false;
+  board["ble_clients"] = 0;
+  #endif
   board["cpu_temp_c"] = temperatureRead();
   board["boot_time_local"] = formatLocalTimeString(bootEpoch);
   board["uptime_s"] = millis() / 1000UL;
@@ -733,6 +928,7 @@ String buildStatusJson() {
   return payload;
 }
 
+#if ENABLE_BLE
 String buildBleTelemetryJson() {
   JsonDocument doc;
   doc["cold_c"] = sensorState.coldC;
@@ -810,6 +1006,11 @@ void syncBleCharacteristics(const bool notify) {
     bleTargetCharacteristic->notify();
   }
 }
+#else
+void syncBleCharacteristics(const bool notify) {
+  (void)notify;
+}
+#endif
 
 void logStatusToSerial() {
   Serial.printf(
@@ -1224,6 +1425,19 @@ void handleRoot() {
   String html;
   html.reserve(15000);
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+#if THEME_RETRO_AMBER
+  html += F("<title>ASI585MC Cooler</title><style>@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');body{margin:0;font-family:'IBM Plex Mono',monospace;font-size:13px;background:#140b00;color:#ffb347;text-shadow:0 0 6px rgba(255,140,0,.18);background-image:linear-gradient(rgba(255,170,0,.03) 50%,rgba(0,0,0,0) 50%);background-size:100% 4px}"
+            "body:before{content:'';position:fixed;inset:0;pointer-events:none;background:radial-gradient(circle at center,rgba(255,180,60,.06),rgba(0,0,0,.25) 70%)}"
+            ".wrap{max-width:1100px;margin:auto;padding:20px}.hero{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px}"
+            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.card{background:#120900;border:1px solid #ff9f1a;border-radius:12px;padding:16px;box-shadow:0 0 0 1px rgba(255,170,0,.15) inset,0 0 22px rgba(255,140,0,.08);display:flex;flex-direction:column}.wide{grid-column:1/-1}"
+            "h1,h2{margin:0 0 10px;letter-spacing:.01em;text-transform:uppercase}h1{font-size:26px}h2{font-size:18px}label{display:block;font-size:12px;color:#ffbf66;margin:8px 0 5px}input,select{width:100%;box-sizing:border-box;background:#1a0d00;color:#ffbf66;border:1px solid #ff9f1a;border-radius:10px;padding:9px;font-family:'IBM Plex Mono',monospace;font-size:12px}"
+            ".uf{position:relative}.uf input{text-align:right;padding-right:44px}.uf span{position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:12px;color:#ffbf66;pointer-events:none}"
+            ".actions{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;margin-top:auto;padding-top:12px}.actions .right{text-align:right}"
+            "button{background:#261200;color:#ffb347;border:1px solid #ff9f1a;border-radius:10px;padding:9px 12px;cursor:pointer;margin:6px 6px 0 0;font-family:'IBM Plex Mono',monospace;font-size:12px;text-transform:uppercase}button.alt{background:#1d1400}button.warn{background:#2a0d00;color:#ff8c42}button:hover{filter:brightness(1.12)}"
+            ".statusGrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}.statusItem{background:#1a0d00;border:1px solid #ff9f1a;border-radius:10px;padding:12px}.statusItem .metric{font-size:28px}.metric{font-size:24px;font-weight:bold}.meta{color:#ffbf66;font-size:12px}.mini{font-size:11px;line-height:1.45;color:#ffc977}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.diag{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px}.diag div:nth-child(odd){color:#ffbf66}.diag div:nth-child(even){text-align:right}"
+            ".chartWrap{position:relative;background:#1a0d00;border:1px solid #ff9f1a;border-radius:10px;padding:10px}.chartLegend{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 8px;font-size:11px;color:#ffc977}.legendItem{display:flex;align-items:center;gap:6px;padding:0;border:none;background:transparent}.chartControls{margin-left:auto;display:flex;align-items:center;gap:6px}.chartControls select{width:auto;padding:4px 8px}.sw{width:14px;height:3px;border-radius:999px}.chartWrap canvas{width:100%;height:240px;display:block;image-rendering:pixelated}"
+            "a{color:#ffd08a}::selection{background:#ff9f1a;color:#1a0d00}@media(max-width:640px){.row{grid-template-columns:1fr}.hero{flex-direction:column;align-items:flex-start}}</style></head><body>");
+#else
   html += F("<title>ASI585MC Cooler</title><style>body{margin:0;font-family:Arial,sans-serif;background:#08111f;color:#e8f0ff}"
             ".wrap{max-width:1100px;margin:auto;padding:20px}.hero{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px}"
             ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.card{background:#111d32;border:1px solid #243757;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);display:flex;flex-direction:column}.wide{grid-column:1/-1}"
@@ -1231,33 +1445,38 @@ void handleRoot() {
             ".uf{position:relative}.uf input{text-align:right;padding-right:48px}.uf span{position:absolute;right:12px;top:50%;transform:translateY(-50%);font-size:13px;color:#9fb5d8;pointer-events:none}"
             ".actions{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;margin-top:auto;padding-top:12px}.actions .right{text-align:right}"
             "button{background:#3385ff;color:white;border:none;border-radius:10px;padding:10px 14px;cursor:pointer;margin:6px 6px 0 0}button.alt{background:#223754}button.warn{background:#b84f32}"
-            ".statusGrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}.statusItem{background:#091221;border:1px solid #243757;border-radius:12px;padding:14px}.statusItem .metric{font-size:32px}.metric{font-size:28px;font-weight:bold}.meta{color:#9fb5d8;font-size:13px}.mini{font-size:12px;line-height:1.5;color:#b7c8e6}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.diag{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px}.diag div:nth-child(odd){color:#9fb5d8}.diag div:nth-child(even){text-align:right}.chartWrap{position:relative;background:#091221;border:1px solid #243757;border-radius:12px;padding:10px}.chartLegend{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 8px;font-size:12px;color:#b7c8e6}.legendItem{display:flex;align-items:center;gap:6px;padding:4px 8px;background:#0f1a2d;border:1px solid #243757;border-radius:999px}.sw{width:14px;height:3px;border-radius:999px}.tooltip{position:absolute;display:none;background:rgba(8,17,31,.94);border:1px solid #35507a;border-radius:10px;padding:8px 10px;font-size:12px;color:#e8f0ff;pointer-events:none;white-space:pre-line}.chartWrap canvas{width:100%;height:240px;display:block}"
+            ".statusGrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}.statusItem{background:#091221;border:1px solid #243757;border-radius:12px;padding:14px}.statusItem .metric{font-size:32px}.metric{font-size:28px;font-weight:bold}.meta{color:#9fb5d8;font-size:13px}.mini{font-size:12px;line-height:1.5;color:#b7c8e6}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.diag{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px}.diag div:nth-child(odd){color:#9fb5d8}.diag div:nth-child(even){text-align:right}.chartWrap{position:relative;background:#091221;border:1px solid #243757;border-radius:12px;padding:10px}.chartLegend{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 8px;font-size:12px;color:#b7c8e6}.legendItem{display:flex;align-items:center;gap:6px;padding:4px 8px;background:#0f1a2d;border:1px solid #243757;border-radius:999px}.chartControls{margin-left:auto;display:flex;align-items:center;gap:6px}.chartControls select{width:auto;padding:6px 8px}.sw{width:14px;height:3px;border-radius:999px}.tooltip{position:absolute;display:none;background:rgba(8,17,31,.94);border:1px solid #35507a;border-radius:10px;padding:8px 10px;font-size:12px;color:#e8f0ff;pointer-events:none;white-space:pre-line}.chartWrap canvas{width:100%;height:240px;display:block}"
             "@media(max-width:640px){.row{grid-template-columns:1fr}.hero{flex-direction:column;align-items:flex-start}}</style></head><body>");
-  html += F("<div class='wrap'><div class='hero'><div><h1>ZWO ASI Smart Cooler</h1><div class='meta'>Firmware <span id='fwVersion'>--</span> | <a id='projectLink' href='#' target='_blank' style='color:#8fc7ff'>https://github.com/naamah75/asi-smart-cooler-diy</a></div></div><div><button onclick='refreshStatus()'>Aggiorna</button><button class='alt' onclick='applyBaseTune()'>Base tune PID</button></div></div>");
-  html += F("<div class='grid'><div class='card wide'><h2>Stato</h2><div class='statusGrid'><div class='statusItem' title='Temperatura misurata sul lato freddo vicino all interfaccia termica della camera'><div class='metric' id='coldMetric'>--</div><div class='meta'>Lato freddo</div></div><div class='statusItem' title='Temperatura misurata sul dissipatore lato caldo'><div class='metric' id='hotMetric'>--</div><div class='meta'>Lato caldo</div></div><div class='statusItem' title='Temperatura dell aria ambiente letta dal sensore BME280'><div class='metric' id='ambientMetric'>--</div><div class='meta'>Ambiente</div></div><div class='statusItem' title='Punto di rugiada calcolato da temperatura e umidita ambiente'><div class='metric' id='dewMetric'>--</div><div class='meta'>Dew point</div></div><div class='statusItem' title='Corrente assorbita dalla cella di Peltier misurata dal sensore di corrente configurato'><div class='metric' id='currentMetric'>--</div><div class='meta'>Corrente</div></div><div class='statusItem' title='Duty PWM attualmente applicato al MOSFET che pilota la Peltier'><div class='metric' id='dutyMetric'>--</div><div class='meta'>Duty PWM</div></div></div></div>");
-  html += F("<div class='card wide'><h2>Grafici</h2><div class='chartWrap'><div class='chartLegend'><div class='legendItem'><span class='sw' style='background:#55d6ff'></span><span>Lato freddo</span></div><div class='legendItem'><span class='sw' style='background:#ff8f6b'></span><span>Lato caldo</span></div><div class='legendItem'><span class='sw' style='background:#6ee7b7'></span><span>Ambiente</span></div><div class='legendItem'><span class='sw' style='background:#3a86ff'></span><span>Potenza Peltier</span></div></div><canvas id='trendChart' width='1000' height='240'></canvas></div></div>");
-  html += F("<div class='card'><h2>Controllo</h2><div class='row'><div><label title='Setpoint richiesto per il lato freddo'>Target freddo</label><div class='uf'><input id='target_c' type='number' step='0.1' title='Setpoint richiesto per il lato freddo'><span>°C</span></div></div><div><label title='Margine minimo di sicurezza sopra il dew point'>Margine dew point</label><div class='uf'><input id='dew_margin_c' type='number' step='0.1' title='Margine minimo di sicurezza sopra il dew point'><span>°C</span></div></div></div><div class='row'><div><label title='Limite massimo normalizzato del duty PWM della Peltier'>Duty max</label><div class='uf'><input id='max_duty' type='number' step='0.01' min='0' max='1' title='Limite massimo normalizzato del duty PWM della Peltier'><span>x</span></div></div><div><label title='Soglia di spegnimento per protezione lato caldo'>T. max lato caldo</label><div class='uf'><input id='max_hot_side_c' type='number' step='0.1' title='Soglia di spegnimento per protezione lato caldo'><span>°C</span></div></div></div><div class='row'><div><label title='Abilita o disabilita il raffreddamento in anello chiuso'>Controllo</label><select id='enabled' title='Abilita o disabilita il raffreddamento in anello chiuso'><option value='true'>Abilitato</option><option value='false'>Disabilitato</option></select></div><div><label title='Abilita la protezione con termistore opzionale lato caldo'>Sensore caldo</label><select id='hot_sensor_enabled' title='Abilita la protezione con termistore opzionale lato caldo'><option value='true'>Abilitato</option><option value='false'>Disabilitato</option></select></div></div><div class='actions'><div><button onclick='saveConfig()' title='Salva i parametri di controllo correnti'>Salva controllo</button></div><div class='right'><button class='warn' onclick='disableCooler()' title='Ferma immediatamente l uscita verso la Peltier'>Stop</button></div></div></div>");
-  html += F("<div class='card'><h2>PID</h2><div class='row'><div><label>Kp</label><input id='kp' type='number' step='0.01'></div><div><label>Ki</label><input id='ki' type='number' step='0.01'></div></div><div class='row'><div><label>Kd</label><input id='kd' type='number' step='0.01'></div><div><label>Profilo rapido</label><select id='pid_profile'><option value='manual'>Manuale</option><option value='soft'>Soft</option><option value='normal'>Normal</option><option value='aggressive'>Aggressive</option></select></div></div><div class='actions'><div><button onclick='savePid()'>Salva PID</button></div><div class='right'><button class='alt' onclick='savePidProfile()'>Applica profilo</button></div></div></div>");
+#endif
+  html += F("<div class='wrap'><div class='hero'><div><h1>ZWO ASI Smart Cooler</h1><div class='meta'>Firmware <span id='fwVersion'>--</span> | <a id='projectLink' href='#' target='_blank' style='color:#8fc7ff'>https://github.com/naamah75/asi-smart-cooler-diy</a></div></div><div><button onclick='refreshStatus()'>Aggiorna</button></div></div>");
+  html += F("<div class='grid'><div class='card wide'><h2>Stato</h2><div class='statusGrid'><div class='statusItem' title='Temperatura misurata sul lato freddo vicino all interfaccia termica della camera'><div class='metric' id='coldMetric'>--</div><div class='meta'>Lato freddo</div></div><div class='statusItem hotOnly' title='Temperatura misurata sul dissipatore lato caldo'><div class='metric' id='hotMetric'>--</div><div class='meta'>Lato caldo</div></div><div class='statusItem' title='Temperatura dell aria ambiente letta dal sensore BME280'><div class='metric' id='ambientMetric'>--</div><div class='meta'>Ambiente</div></div><div class='statusItem' title='Punto di rugiada calcolato da temperatura e umidita ambiente'><div class='metric' id='dewMetric'>--</div><div class='meta'>Dew point</div></div><div class='statusItem' title='Corrente assorbita dalla cella di Peltier misurata dal sensore di corrente configurato'><div class='metric' id='currentMetric'>--</div><div class='meta'>Corrente</div></div><div class='statusItem' title='Duty PWM attualmente applicato al MOSFET che pilota la Peltier'><div class='metric' id='dutyMetric'>--</div><div class='meta'>Duty PWM</div></div></div></div>");
+  html += F("<div class='card wide'><h2>Grafici</h2><div class='chartWrap'><div class='chartLegend'><div class='legendItem'><span class='sw' style='background:#55d6ff'></span><span>Lato freddo</span></div><div class='legendItem hotOnly'><span class='sw' style='background:#ff8f6b'></span><span>Lato caldo</span></div><div class='legendItem'><span class='sw' style='background:#6ee7b7'></span><span>Ambiente</span></div><div class='legendItem'><span class='sw' style='background:#3a86ff'></span><span>Potenza Peltier</span></div><div class='chartControls'><span>Scala</span><select id='chart_window'><option value='900'>15 min</option><option value='3600'>1 ora</option><option value='14400' selected>4 ore</option><option value='43200'>12 ore</option></select></div></div><canvas id='trendChart' width='1000' height='240'></canvas></div></div>");
+  html += F("<div class='card'><h2>Controllo</h2><div class='row'><div><label title='Setpoint richiesto per il lato freddo'>Target freddo</label><div class='uf'><input id='target_c' type='number' step='0.1' title='Setpoint richiesto per il lato freddo'><span>°C</span></div></div><div><label title='Margine minimo di sicurezza sopra il dew point'>Margine dewp</label><div class='uf'><input id='dew_margin_c' type='number' step='0.1' title='Margine minimo di sicurezza sopra il dew point'><span>°C</span></div></div></div><div class='row'><div><label title='Limite massimo normalizzato del duty PWM della Peltier'>Duty max</label><div class='uf'><input id='max_duty' type='number' step='0.01' min='0' max='1' title='Limite massimo normalizzato del duty PWM della Peltier'><span>x</span></div></div><div class='hotOnly'><label title='Soglia di spegnimento per protezione lato caldo'>T. max caldo</label><div class='uf'><input id='max_hot_side_c' type='number' step='0.1' title='Soglia di spegnimento per protezione lato caldo'><span>°C</span></div></div></div><div class='row'><div><label title='Abilita o disabilita il raffreddamento in anello chiuso'>Controllo</label><select id='enabled' title='Abilita o disabilita il raffreddamento in anello chiuso'><option value='true'>Abilitato</option><option value='false'>Disabilitato</option></select></div><div></div></div><div class='actions'><div><button onclick='saveConfig()' title='Salva i parametri di controllo correnti'>Salva controllo</button></div><div class='right'><button class='warn' onclick='disableCooler()' title='Ferma immediatamente l uscita verso la Peltier'>Stop</button></div></div></div>");
+  html += F("<div class='card'><h2>PID</h2><div class='row'><div><label>Kp</label><input id='kp' type='number' step='0.01'></div><div><label>Ki</label><input id='ki' type='number' step='0.01'></div></div><div class='row'><div><label>Kd</label><input id='kd' type='number' step='0.01'></div><div><label>Profilo rapido</label><select id='pid_profile'><option value='manual'>Manuale</option><option value='soft'>Soft</option><option value='normal'>Normal</option><option value='aggressive'>Aggressive</option></select></div></div><div class='actions'><div><button class='alt' onclick='applyBaseTune()'>Calibrazione PID</button></div><div class='right'><button onclick='savePid()'>Salva PID</button></div></div></div>");
   html += F("<div class='card'><h2>Calibrazioni</h2><div class='row'><div><label>Offset freddo</label><div class='uf'><input id='cold_offset_c' type='number' step='0.1'><span>°C</span></div></div><div><label>Offset caldo</label><div class='uf'><input id='hot_offset_c' type='number' step='0.1'><span>°C</span></div></div></div><div class='row'><div><label>Offset ambiente</label><div class='uf'><input id='ambient_offset_c' type='number' step='0.1'><span>°C</span></div></div><div><label>Offset umidita</label><div class='uf'><input id='humidity_offset_pct' type='number' step='0.1'><span>%</span></div></div></div><div class='row'><div><label>Offset corrente</label><div class='uf'><input id='current_offset_a' type='number' step='0.01'><span>A</span></div></div><div><label>Scala corrente</label><div class='uf'><input id='current_scale' type='number' step='0.01'><span>x</span></div></div></div><div class='actions'><div><button onclick='saveCalibration()'>Salva calibrazioni</button></div><div></div></div></div>");
   html += F("<div class='card'><h2>Preimpostazioni</h2><label title='Profili operativi salvati'>Preset</label><select id='preset_name' title='Profili operativi salvati'><option value='estate'>Estate</option><option value='inverno'>Inverno</option><option value='deep_cooling'>Deep cooling</option></select><div class='mini' id='presetInfo' style='margin-top:18px;display:grid;grid-template-columns:1fr auto;gap:8px 18px'><div>Target</div><div>--</div><div>Dew margin</div><div>--</div><div>Duty max</div><div>--</div></div><div class='actions'><div><button onclick='applyPreset()' title='Carica la preimpostazione selezionata nella configurazione attiva'>Applica preset</button></div><div class='right'><button class='alt' onclick='savePreset()' title='Sovrascrive la preimpostazione selezionata con la configurazione attuale'>Salva preset corrente</button></div></div></div>");
   html += F("<div class='card'><h2>Statistiche</h2><div class='mini diag'><div>WiFi signal</div><div id='wifiRssi'>--</div><div>BSSID</div><div id='wifiBssid'>--</div><div>IP</div><div id='boardIp'>--</div><div>BLE</div><div id='bleState'>--</div><div>Free RAM</div><div id='freeHeap'>--</div><div>CPU temp</div><div id='cpuTemp'>--</div><div>Avvio</div><div id='bootTime'>--</div></div></div>");
-  html += F("<script>function fmt(v,u=''){return Number.isFinite(v)?v.toFixed(2)+u:'--'}function boolVal(id){return document.getElementById(id).value==='true'}function numVal(id){return parseFloat(document.getElementById(id).value)}"
-            "const HIST_MAX=720;const HIST_STEP_S=20;const hist={cold:[],hot:[],ambient:[],power:[],t:[]};let lastHistS=-999;let chartGeom=null;function pushHistSample(j){const nowS=Math.floor((j.board.uptime_s||0));if(nowS-lastHistS<HIST_STEP_S&&hist.t.length)return;lastHistS=nowS;const map={cold:j.sensor.cold_c,hot:j.sensor.hot_c,ambient:j.sensor.ambient_c,power:j.control.pwm_duty*100,t:nowS};Object.keys(map).forEach(k=>{if(Number.isFinite(map[k])||k==='t'){hist[k].push(map[k]);if(hist[k].length>HIST_MAX)hist[k].shift()}})}function fillField(id,v){if(Number.isFinite(v))document.getElementById(id).value=v}function fillBool(id,v){document.getElementById(id).value=v?'true':'false'}"
+  html += F("<script>function fmt(v,u=''){const n=Number(v);return Number.isFinite(n)?n.toFixed(2)+u:'--'}function boolVal(id){return document.getElementById(id).value==='true'}function numVal(id){return parseFloat(document.getElementById(id).value)}"
+            "const HIST_MAX=2160;const HIST_STEP_S=20;const hist={cold:[],hot:[],ambient:[],power:[],t:[]};let lastHistS=-999;let chartGeom=null;let hotEnabled=false;let chartWindowS=14400;function pushHistSample(j){const nowS=Math.floor((j.board.uptime_s||0));if(nowS-lastHistS<HIST_STEP_S&&hist.t.length)return;lastHistS=nowS;const map={cold:j.sensor.cold_c,hot:j.sensor.hot_c,ambient:j.sensor.ambient_c,power:j.control.pwm_duty*100,t:nowS};Object.keys(map).forEach(k=>{hist[k].push(Number(map[k]));if(hist[k].length>HIST_MAX)hist[k].shift()})}function fillField(id,v){const el=document.getElementById(id);const n=Number(v);if(el&&Number.isFinite(n))el.value=n}function fillBool(id,v){const el=document.getElementById(id);if(el)el.value=v?'true':'false'}function setHotVisibility(on){hotEnabled=!!on;document.querySelectorAll('.hotOnly').forEach(el=>el.style.display=hotEnabled?'':'none')}"
             "async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});return await r.json()}"
-            "function drawLine(ctx,data,minV,maxV,color,left,top,bottom,w){if(data.length<2)return;ctx.beginPath();ctx.lineWidth=2.2;ctx.strokeStyle=color;data.forEach((v,i)=>{const px=left+(i/Math.max(data.length-1,1))*w;const py=bottom-((v-minV)/Math.max(maxV-minV,0.001))*(bottom-top);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py)});ctx.stroke()}function redrawCharts(){const c=document.getElementById('trendChart');const x=c.getContext('2d');const left=46,right=46,top=14,bottom=c.height-26,w=c.width-left-right;chartGeom={left,right,top,bottom,w};x.clearRect(0,0,c.width,c.height);const temps=[...hist.cold,...hist.hot,...hist.ambient].filter(Number.isFinite);const tMin=temps.length?Math.min(...temps)-1:0;const tMax=temps.length?Math.max(...temps)+1:10;for(let i=0;i<5;i++){const y=top+i*((bottom-top)/4);x.strokeStyle='#223754';x.lineWidth=1;x.beginPath();x.moveTo(left,y);x.lineTo(c.width-right,y);x.stroke();const tVal=(tMax-((tMax-tMin)/4)*i).toFixed(0);x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText(tVal,4,y+4);const pVal=(100-25*i).toFixed(0);x.fillText(pVal,c.width-right+8,y+4)}for(let h=0;h<=4;h++){const px=left+(h/4)*w;x.strokeStyle='#1a2740';x.beginPath();x.moveTo(px,top);x.lineTo(px,bottom);x.stroke();x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText(`-${4-h}h`,Math.max(px-10,2),c.height-6)}x.strokeStyle='#3b4f73';x.beginPath();x.moveTo(left,top);x.lineTo(left,bottom);x.lineTo(c.width-right,bottom);x.lineTo(c.width-right,top);x.stroke();drawLine(x,hist.cold,tMin,tMax,'#55d6ff',left,top,bottom,w);drawLine(x,hist.hot,tMin,tMax,'#ff8f6b',left,top,bottom,w);drawLine(x,hist.ambient,tMin,tMax,'#6ee7b7',left,top,bottom,w);drawLine(x,hist.power,0,100,'#3a86ff',left,top,bottom,w)}function syncUi(j){coldMetric.textContent=fmt(j.sensor.cold_c,' °C');dewMetric.textContent=fmt(j.sensor.dew_point_c,' °C');currentMetric.textContent=fmt(j.sensor.current_a,' A');hotMetric.textContent=fmt(j.sensor.hot_c,' °C');ambientMetric.textContent=fmt(j.sensor.ambient_c,' °C');dutyMetric.textContent=fmt(j.control.pwm_duty*100,' %');fwVersion.textContent=j.board.firmware_version||'--';projectLink.href=j.board.project_url||'#';projectLink.textContent=j.board.project_url||'--';boardIp.textContent=j.network.ip||'--';wifiRssi.textContent=Number.isFinite(j.board.wifi_rssi_dbm)?j.board.wifi_rssi_dbm+' dBm':'--';wifiBssid.textContent=j.board.wifi_bssid||'--';bleState.textContent=j.board.ble_connected?('Connected '+j.board.ble_clients):'Idle';freeHeap.textContent=Number.isFinite(j.board.free_heap_bytes)?j.board.free_heap_bytes+' B':'--';cpuTemp.textContent=fmt(j.board.cpu_temp_c,' °C');bootTime.textContent=j.board.boot_time_local||'--';pushHistSample(j);redrawCharts();"
+            "function drawLine(ctx,data,minV,maxV,color,left,top,bottom,w){if(data.length<2)return;ctx.beginPath();ctx.lineWidth=2.2;ctx.strokeStyle=color;data.forEach((v,i)=>{const px=left+(i/Math.max(data.length-1,1))*w;const py=bottom-((v-minV)/Math.max(maxV-minV,0.001))*(bottom-top);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py)});ctx.stroke()}function redrawCharts(){const c=document.getElementById('trendChart');const x=c.getContext('2d');const left=46,right=46,top=14,bottom=c.height-26,w=c.width-left-right;chartGeom={left,right,top,bottom,w};x.clearRect(0,0,c.width,c.height);const temps=[...hist.cold,...hist.hot,...hist.ambient].filter(Number.isFinite);const tMin=temps.length?Math.min(...temps)-1:0;const tMax=temps.length?Math.max(...temps)+1:10;for(let i=0;i<5;i++){const y=top+i*((bottom-top)/4);x.strokeStyle='#223754';x.lineWidth=1;x.beginPath();x.moveTo(left,y);x.lineTo(c.width-right,y);x.stroke();const tVal=(tMax-((tMax-tMin)/4)*i).toFixed(0);x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText(tVal,4,y+4);const pVal=(100-25*i).toFixed(0);x.fillText(pVal,c.width-right+8,y+4)}for(let h=0;h<=4;h++){const px=left+(h/4)*w;x.strokeStyle='#1a2740';x.beginPath();x.moveTo(px,top);x.lineTo(px,bottom);x.stroke();x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText(`-${4-h}h`,Math.max(px-10,2),c.height-6)}x.strokeStyle='#3b4f73';x.beginPath();x.moveTo(left,top);x.lineTo(left,bottom);x.lineTo(c.width-right,bottom);x.lineTo(c.width-right,top);x.stroke();drawLine(x,hist.cold,tMin,tMax,'#55d6ff',left,top,bottom,w);if(hotEnabled){drawLine(x,hist.hot,tMin,tMax,'#ff8f6b',left,top,bottom,w)}drawLine(x,hist.ambient,tMin,tMax,'#6ee7b7',left,top,bottom,w);drawLine(x,hist.power,0,100,'#3a86ff',left,top,bottom,w)}function syncUi(j){coldMetric.textContent=fmt(j.sensor.cold_c,' °C');dewMetric.textContent=fmt(j.sensor.dew_point_c,' °C');currentMetric.textContent=fmt(j.sensor.current_a,' A');hotMetric.textContent=fmt(j.sensor.hot_c,' °C');ambientMetric.textContent=fmt(j.sensor.ambient_c,' °C');dutyMetric.textContent=fmt(j.control.pwm_duty*100,' %');fwVersion.textContent=j.board.firmware_version||'--';projectLink.href=j.board.project_url||'#';projectLink.textContent=j.board.project_url||'--';boardIp.textContent=j.network.ip||'--';wifiRssi.textContent=Number.isFinite(j.board.wifi_rssi_dbm)?j.board.wifi_rssi_dbm+' dBm':'--';wifiBssid.textContent=j.board.wifi_bssid||'--';bleState.textContent=j.board.ble_connected?('Connected '+j.board.ble_clients):'Idle';freeHeap.textContent=Number.isFinite(j.board.free_heap_bytes)?j.board.free_heap_bytes+' B':'--';cpuTemp.textContent=fmt(j.board.cpu_temp_c,' °C');bootTime.textContent=j.board.boot_time_local||'--';setHotVisibility(!!j.control.hot_sensor_enabled);pushHistSample(j);redrawCharts();"
             "fillField('target_c',j.control.target_c);fillField('dew_margin_c',j.control.dew_margin_c);fillField('max_duty',j.control.max_duty);fillField('max_hot_side_c',j.control.max_hot_side_c);fillBool('enabled',j.control.enabled);fillBool('hot_sensor_enabled',j.control.hot_sensor_enabled);"
             "fillField('kp',j.pid.kp);fillField('ki',j.pid.ki);fillField('kd',j.pid.kd);document.getElementById('pid_profile').value=['soft','normal','aggressive'].includes(j.pid.profile)?j.pid.profile:'manual';"
             "fillField('cold_offset_c',j.calibration.cold_offset_c);fillField('hot_offset_c',j.calibration.hot_offset_c);fillField('ambient_offset_c',j.calibration.ambient_offset_c);fillField('humidity_offset_pct',j.calibration.humidity_offset_pct);fillField('current_offset_a',j.calibration.current_offset_a);fillField('current_scale',j.calibration.current_scale);const p=document.getElementById('preset_name').value;const pr=j.presets&&j.presets[p]?j.presets[p]:null;document.getElementById('presetInfo').innerHTML=pr?`<div>Target</div><div>${fmt(pr.target_c,' °C')}</div><div>Dew margin</div><div>${fmt(pr.dew_margin_c,' °C')}</div><div>Duty max</div><div>${fmt(pr.max_duty*100,' %')}</div>`:'<div>Preset</div><div>non disponibile</div>'}"
             "async function refreshStatus(){syncUi(await api('/api/status'))}"
-            "async function saveConfig(){syncUi(await api('/api/config',{enabled:boolVal('enabled'),hot_sensor_enabled:boolVal('hot_sensor_enabled'),target_c:numVal('target_c'),dew_margin_c:numVal('dew_margin_c'),max_duty:numVal('max_duty'),max_hot_side_c:numVal('max_hot_side_c')}))}"
+            "async function saveConfig(){syncUi(await api('/api/config',{enabled:boolVal('enabled'),target_c:numVal('target_c'),dew_margin_c:numVal('dew_margin_c'),max_duty:numVal('max_duty'),max_hot_side_c:numVal('max_hot_side_c')}))}"
             "async function disableCooler(){syncUi(await api('/api/config',{enabled:false}))}"
             "async function savePid(){syncUi(await api('/api/config',{pid:{kp:numVal('kp'),ki:numVal('ki'),kd:numVal('kd')}}))}"
             "async function savePidProfile(){syncUi(await api('/api/config',{pid_profile:document.getElementById('pid_profile').value}))}"
             "async function applyBaseTune(){syncUi(await api('/api/pid/base-tune',{}))}"
             "async function saveCalibration(){syncUi(await api('/api/config',{calibration:{cold_offset_c:numVal('cold_offset_c'),hot_offset_c:numVal('hot_offset_c'),ambient_offset_c:numVal('ambient_offset_c'),humidity_offset_pct:numVal('humidity_offset_pct'),current_offset_a:numVal('current_offset_a'),current_scale:numVal('current_scale')}}))}"
             "async function applyPreset(){syncUi(await api('/api/preset/apply',{name:document.getElementById('preset_name').value}))}"
-            "async function savePreset(){syncUi(await api('/api/preset/save',{name:document.getElementById('preset_name').value}))}document.getElementById('preset_name').addEventListener('change',refreshStatus);"
-            "refreshStatus();setInterval(refreshStatus,2000);</script></div></body></html>");
+            "async function savePreset(){syncUi(await api('/api/preset/save',{name:document.getElementById('preset_name').value}))}document.getElementById('preset_name').addEventListener('change',refreshStatus);document.getElementById('pid_profile').addEventListener('change',savePidProfile);"
+            "refreshStatus();setInterval(refreshStatus,2000);</script><script>"
+            "function drawLine(ctx,data,minV,maxV,color,left,top,bottom,w){if(data.length<2)return;ctx.beginPath();ctx.lineWidth=2.2;ctx.strokeStyle=color;let started=false;data.forEach((v,i)=>{if(!Number.isFinite(v)){started=false;return}const px=left+(i/Math.max(data.length-1,1))*w;const py=bottom-((v-minV)/Math.max(maxV-minV,0.001))*(bottom-top);if(!started){ctx.moveTo(px,py);started=true}else ctx.lineTo(px,py)});ctx.stroke()}"
+            "function timeLabel(s){return s>=3600?Math.round(s/3600)+'h':Math.round(s/60)+'m'}function chartView(k,idx){return idx.map(i=>hist[k][i])}"
+            "function redrawCharts(){const c=document.getElementById('trendChart');const x=c.getContext('2d');const left=46,right=46,top=14,bottom=c.height-26,w=c.width-left-right;chartGeom={left,right,top,bottom,w};x.clearRect(0,0,c.width,c.height);const latest=hist.t.length?hist.t[hist.t.length-1]:0;const from=latest-chartWindowS;const idx=hist.t.map((t,i)=>t>=from?i:-1).filter(i=>i>=0);const cold=chartView('cold',idx),hot=chartView('hot',idx),ambient=chartView('ambient',idx),power=chartView('power',idx);const temps=[...cold,...hot,...ambient].filter(Number.isFinite);const tMin=temps.length?Math.min(...temps)-1:0;const tMax=temps.length?Math.max(...temps)+1:10;for(let i=0;i<5;i++){const y=top+i*((bottom-top)/4);x.strokeStyle='#223754';x.lineWidth=1;x.beginPath();x.moveTo(left,y);x.lineTo(c.width-right,y);x.stroke();const tVal=(tMax-((tMax-tMin)/4)*i).toFixed(0);x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText(tVal,4,y+4);const pVal=(100-25*i).toFixed(0);x.fillText(pVal,c.width-right+8,y+4)}for(let h=0;h<=4;h++){const px=left+(h/4)*w;x.strokeStyle='#1a2740';x.beginPath();x.moveTo(px,top);x.lineTo(px,bottom);x.stroke();x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText('-'+timeLabel(chartWindowS*(1-h/4)),Math.max(px-14,2),c.height-6)}x.strokeStyle='#3b4f73';x.beginPath();x.moveTo(left,top);x.lineTo(left,bottom);x.lineTo(c.width-right,bottom);x.lineTo(c.width-right,top);x.stroke();drawLine(x,cold,tMin,tMax,'#55d6ff',left,top,bottom,w);if(hotEnabled){drawLine(x,hot,tMin,tMax,'#ff8f6b',left,top,bottom,w)}drawLine(x,ambient,tMin,tMax,'#6ee7b7',left,top,bottom,w);drawLine(x,power,0,100,'#3a86ff',left,top,bottom,w)}"
+            "document.getElementById('chart_window').addEventListener('change',e=>{chartWindowS=Number(e.target.value);redrawCharts()});</script></div></body></html>");
   server.send(200, "text/html", html);
 }
 
@@ -1270,6 +1489,7 @@ void handleCaptiveRedirect() {
   server.send(404, "text/plain", "Not found");
 }
 
+#if ENABLE_BLE
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* characteristic) override {
     const std::string value = characteristic->getValue();
@@ -1375,6 +1595,9 @@ void setupBle() {
   advertising->start();
   syncBleCharacteristics(false);
 }
+#else
+void setupBle() {}
+#endif
 
 void startCaptivePortal() {
   if (captivePortalActive) {
@@ -1445,6 +1668,15 @@ void ensureWifi() {
 
   if (WiFi.isConnected()) {
     stopCaptivePortal();
+    if (!wifiConnectedLogged) {
+      Serial.printf(
+          "WiFi connesso: SSID='%s' IP=%s gateway=%s mDNS=http://%s.local/\n",
+          WiFi.SSID().c_str(),
+          WiFi.localIP().toString().c_str(),
+          WiFi.gatewayIP().toString().c_str(),
+          networkConfig.hostname.c_str());
+      wifiConnectedLogged = true;
+    }
     if (!ntpConfigured) {
       configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
       ntpConfigured = true;
@@ -1457,6 +1689,10 @@ void ensureWifi() {
     }
     if (!mdnsStarted && MDNS.begin(networkConfig.hostname.c_str())) {
       MDNS.addService("http", "tcp", 80);
+      MDNS.addServiceTxt("http", "tcp", "path", "/");
+      MDNS.addServiceTxt("http", "tcp", "api", "/api/status");
+      MDNS.addServiceTxt("http", "tcp", "fw", FW_VERSION);
+      MDNS.addServiceTxt("http", "tcp", "device", "asi585mc-cooler");
       mdnsStarted = true;
       Serial.printf("mDNS attivo su http://%s.local\n", networkConfig.hostname.c_str());
     }
@@ -1469,6 +1705,7 @@ void ensureWifi() {
     MDNS.end();
     mdnsStarted = false;
   }
+  wifiConnectedLogged = false;
 
   const uint32_t now = millis();
   if (now - lastWifiAttemptMs < timing::WIFI_RETRY_MS) {
@@ -1484,9 +1721,73 @@ void ensureWifi() {
   WiFi.begin(networkConfig.wifiSsid.c_str(), networkConfig.wifiPassword.c_str());
 }
 
+void updateStatusLed(const uint32_t now) {
+  if (WiFi.isConnected()) {
+    writeStatusLed(true);
+    return;
+  }
+
+  if (now - lastLedToggleMs >= 500) {
+    lastLedToggleMs = now;
+    writeStatusLed(!statusLedOn);
+  }
+}
+
+void updateOledDisplay() {
+#if BOARD_LOLIN_S2_PICO
+  static uint32_t lastDisplayMs = 0;
+  const uint32_t now = millis();
+  if (now - lastDisplayMs < 1000) {
+    return;
+  }
+  lastDisplayMs = now;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print(WiFi.isConnected() ? WiFi.localIP().toString() : String("WiFi..."));
+  display.setCursor(0, 10);
+  display.print("Cold ");
+  if (isfinite(sensorState.coldC)) {
+    display.print(sensorState.coldC, 1);
+    display.print("C");
+  } else {
+    display.print("--");
+  }
+  display.setCursor(70, 10);
+  display.print("PWM ");
+  display.print(controlState.pwmDuty * 100.0f, 0);
+  display.print("%");
+  display.setCursor(0, 22);
+  display.print(controlConfig.enabled ? "ON " : "OFF");
+  display.print(" T ");
+  display.print(controlConfig.targetC, 1);
+  display.print("C");
+  display.display();
+#endif
+}
+
 void setupSensors() {
   Wire.begin(pins::I2C_SDA, pins::I2C_SCL);
-  sensorState.bmeOk = bme.begin(0x76) || bme.begin(0x77);
+#if BOARD_LOLIN_S2_PICO
+  pinMode(pins::OLED_RESET, OUTPUT);
+  digitalWrite(pins::OLED_RESET, LOW);
+  delay(10);
+  digitalWrite(pins::OLED_RESET, HIGH);
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("ASI cooler boot");
+    display.display();
+  }
+#endif
+  Serial.printf("Pin NTC: freddo=GPIO%u caldo=GPIO%u\n", pins::COLD_NTC_ADC, pins::HOT_NTC_ADC);
+  scanI2cBus();
+  bmePresent = bme.begin(0x76) || bme.begin(0x77);
+  sensorState.bmeOk = bmePresent;
 
 #if USE_ADS1115
   sensorState.adsOk = ads.begin();
@@ -1500,16 +1801,27 @@ void setupSensors() {
 #if USE_ACS71X_CURRENT
   sensorState.inaOk = false;
 #else
-  sensorState.inaOk = ina219.begin();
-  if (sensorState.inaOk) {
+  ina219Present = ina219.begin();
+  sensorState.inaOk = ina219Present;
+  if (ina219Present) {
     ina219.setCalibration_32V_2A();
   }
 #endif
 
 #if !USE_ADS1115
   analogReadResolution(12);
+  pinMode(pins::CURRENT_ADC, INPUT);
+  pinMode(pins::COLD_NTC_ADC, INPUT);
+  pinMode(pins::HOT_NTC_ADC, INPUT);
+  analogSetPinAttenuation(pins::CURRENT_ADC, ADC_11db);
   analogSetPinAttenuation(pins::COLD_NTC_ADC, ADC_11db);
   analogSetPinAttenuation(pins::HOT_NTC_ADC, ADC_11db);
+#if CONFIG_IDF_TARGET_ESP32
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_11);
+  adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_11);
+  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);
+#endif
 #if USE_ACS71X_CURRENT
   analogSetPinAttenuation(pins::CURRENT_ADC, ADC_11db);
 #endif
@@ -1525,6 +1837,8 @@ void setupControl() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  pinMode(pins::STATUS_LED, OUTPUT);
+  writeStatusLed(false);
   loadPreferences();
   setupControl();
   setupSensors();
@@ -1539,6 +1853,8 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
   ensureWifi();
+  updateStatusLed(now);
+  updateOledDisplay();
   if (captivePortalActive) {
     dnsServer.processNextRequest();
   }
@@ -1556,10 +1872,12 @@ void loop() {
     updateControl(max(dtSeconds, 0.1f));
   }
 
+#if ENABLE_BLE
   if (bleStatusCharacteristic != nullptr && now - lastBleNotifyMs >= timing::STATUS_NOTIFY_MS) {
     lastBleNotifyMs = now;
     syncBleCharacteristics(true);
   }
+#endif
 
   if (now - lastSerialLogMs >= timing::SERIAL_LOG_MS) {
     lastSerialLogMs = now;

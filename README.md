@@ -2,7 +2,7 @@
 
 Firmware PlatformIO per ESP32 che controlla una cella di Peltier per raffreddare una camera ZWO ASI585MC.
 
-Target hardware attuale: `Wemos/LOLIN D32 Pro`.
+Target hardware attuale: `Wemos/LOLIN S2 Pico`, con supporto anche per `Wemos/LOLIN D32 Pro`.
 
 ## Funzioni implementate
 
@@ -26,14 +26,27 @@ Target hardware attuale: `Wemos/LOLIN D32 Pro`.
 - AP fallback con captive portal per onboarding WiFi
 - Menu `Settings` persistente per rete e parametri di connettivita
 - Scan reti WiFi dal captive portal e dalla pagina Settings
+- Display OLED SSD1306 128x32 integrato sulla versione `LOLIN S2 Pico`
 
 ## Pinout di default
+
+Pin attuali per `LOLIN S2 Pico`:
+
+- `GPIO11`: PWM gate MOSFET Peltier
+- `GPIO10`: LED stato active-low
+- `GPIO1`: ADC NTC freddo 10K B3950
+- `GPIO2`: ADC NTC caldo opzionale 10K B3950
+- `GPIO3`: ADC sensore corrente ACS71x quando si usa ADC interno ESP32-S2
+- `GPIO8`: SDA I2C
+- `GPIO9`: SCL I2C
+- `GPIO18`: reset OLED SSD1306
 
 Pin proposti per `LOLIN D32 Pro`:
 
 - `GPIO25`: PWM gate MOSFET Peltier
-- `GPIO34`: ADC NTC freddo 10K B3950
-- `GPIO35`: ADC NTC caldo opzionale 10K B3950
+- `GPIO5`: LED stato active-low
+- `GPIO33`: ADC NTC freddo 10K B3950
+- `GPIO36` / `VP`: ADC NTC caldo opzionale 10K B3950
 - `GPIO32`: ADC sensore corrente ACS71x quando si usa ADC interno ESP32
 - `GPIO21`: SDA I2C
 - `GPIO22`: SCL I2C
@@ -48,12 +61,23 @@ Environment disponibili:
 - `lolin_d32_pro_espadc_acs71x`
 - `lolin_d32_pro_ads1115_ina219`
 - `lolin_d32_pro_ads1115_acs71x`
+- `lolin_d32_pro_espadc_ina219_classic`
+- `lolin_d32_pro_espadc_acs71x_classic`
+- `lolin_d32_pro_ads1115_ina219_classic`
+- `lolin_d32_pro_ads1115_acs71x_classic`
+- `lolin_s2_pico_espadc_ina219`
 
 Configurazione consigliata di default per partire:
 
-- `lolin_d32_pro_espadc_ina219`
+- `lolin_s2_pico_espadc_ina219`
 
 Questa e anche la configurazione attualmente impostata come `default_envs` nel progetto.
+
+Tema dashboard di default:
+
+- tema retrò ambra stile monitor DOS/CRT
+
+Per tornare al look classico usa gli environment con suffisso `_classic`.
 
 Significato:
 
@@ -94,6 +118,43 @@ In molti moduli analogici alimentati a `3.3V`, `ACS_ZERO_V` puo partire da circa
 - INA219 sul bus I2C della Peltier
 - BME280 sullo stesso bus I2C a `0x76` o `0x77`
 - MOSFET logic level comandato direttamente da ESP32 con adeguato driver/pull-down se necessario
+
+## Taratura NTC e ADC ESP32-S2
+
+La versione `LOLIN S2 Pico` usa l'ADC interno dell'ESP32-S2. Con attenuazione `ADC_11db` il range utile documentato per ESP32-S2 e circa `0-2.5V`, quindi il firmware non scala il raw ADC sulla tensione di alimentazione `3.3V`.
+
+Parametri attuali in `platformio.ini` per `lolin_s2_pico_espadc_ina219`:
+
+- `NTC_SERIES_RESISTOR_OHM=9890.0f`: resistenza reale del partitore misurata, `9.89 kOhm`
+- `NTC_SUPPLY_VOLTAGE=3.28f`: tensione reale tra `3V3` e `GND`
+- `NTC_ADC_FULL_SCALE_V=2.50f`: scala ADC raw ESP32-S2 a `ADC_11db`
+- `NTC_COLD_TEMP_OFFSET_C=0.0f`: offset temperatura sonda fredda
+- `NTC_HOT_TEMP_OFFSET_C=0.0f`: offset temperatura sonda calda
+
+Misure di riferimento usate per la taratura iniziale:
+
+- tensione `3V3-GND`: `3.28V`
+- tensione `ADC NTC-GND`: `1.635V`
+- resistenza fissa partitore: `9.89 kOhm`
+
+La formula del partitore e:
+
+```text
+Rntc = Rserie * Vadc / (Vsupply - Vadc)
+```
+
+Gli offset temperatura possono essere modificati in due modi:
+
+- a build time da `platformio.ini` con `NTC_COLD_TEMP_OFFSET_C` e `NTC_HOT_TEMP_OFFSET_C`
+- a runtime dalla pagina web, sezione `Calibrazioni`, dove vengono salvati in flash tramite `Preferences`
+
+Se un offset e gia stato salvato dalla UI, il valore salvato in flash prevale sul default compilato in `platformio.ini`.
+
+## Modello 3D
+
+Per l'involucro della camera, della Peltier e del dissipatore con ventola e disponibile un modello stampabile in 3D su Thingiverse:
+
+- https://www.thingiverse.com/thing:5873931
 
 ## Configurazione WiFi
 
