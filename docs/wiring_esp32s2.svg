@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050">
+  <defs>
+    <style>
+      .bg { fill: #0b1020; }
+      .box { fill: #111a2e; stroke: #7aa2ff; stroke-width: 3; rx: 16; }
+      .module { fill: #15233d; stroke: #9cc2ff; stroke-width: 2.5; rx: 12; }
+      .sensor { fill: #17311f; stroke: #8ee6a2; stroke-width: 2.5; rx: 12; }
+      .power { fill: #301a13; stroke: #ffb36b; stroke-width: 2.5; rx: 12; }
+      .warn { fill: #331419; stroke: #ff6b85; stroke-width: 2.5; rx: 12; }
+      .txt { fill: #eaf2ff; font-family: Arial, Helvetica, sans-serif; font-size: 22px; }
+      .small { fill: #b8c7e6; font-family: Arial, Helvetica, sans-serif; font-size: 17px; }
+      .pin { fill: #ffd166; font-family: Arial, Helvetica, sans-serif; font-size: 18px; font-weight: bold; }
+      .title { fill: #ffffff; font-family: Arial, Helvetica, sans-serif; font-size: 34px; font-weight: bold; }
+      .subtitle { fill: #b8c7e6; font-family: Arial, Helvetica, sans-serif; font-size: 20px; }
+      .wire3v3 { stroke: #ff4d4d; stroke-width: 4; fill: none; }
+      .wire5v { stroke: #ff9f1a; stroke-width: 4; fill: none; }
+      .wire12v { stroke: #ffcc00; stroke-width: 4; fill: none; }
+      .wiregnd { stroke: #9aa4b2; stroke-width: 4; fill: none; }
+      .wiresig { stroke: #55d6ff; stroke-width: 4; fill: none; }
+      .wirei2c { stroke: #bd93f9; stroke-width: 4; fill: none; }
+      .wirepwm { stroke: #50fa7b; stroke-width: 4; fill: none; }
+      .dash { stroke-dasharray: 10 8; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#eaf2ff"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1050"/>
+  <text class="title" x="50" y="55">ASI585MC Peltier Controller - Collegamenti LOLIN S2 Pico</text>
+  <text class="subtitle" x="50" y="88">Schema logico per firmware attuale: PWM GPIO11, NTC freddo GPIO1, NTC caldo GPIO2, I2C GPIO8/GPIO9.</text>
+
+  <!-- ESP32-S2 Pico -->
+  <rect class="box" x="560" y="145" width="410" height="650"/>
+  <text class="txt" x="630" y="185">LOLIN S2 Pico / ESP32-S2</text>
+  <text class="small" x="605" y="220">Alimenta la scheda da USB oppure VIN/5V</text>
+  <text class="small" x="605" y="246">Tutti i GND devono essere comuni</text>
+
+  <text class="pin" x="592" y="310">GPIO1</text><text class="small" x="675" y="310">ADC NTC freddo</text>
+  <text class="pin" x="592" y="360">GPIO2</text><text class="small" x="675" y="360">ADC NTC caldo</text>
+  <text class="pin" x="592" y="410">GPIO3</text><text class="small" x="675" y="410">ADC corrente opzionale</text>
+  <text class="pin" x="592" y="480">GPIO8</text><text class="small" x="675" y="480">I2C SDA</text>
+  <text class="pin" x="592" y="530">GPIO9</text><text class="small" x="675" y="530">I2C SCL</text>
+  <text class="pin" x="592" y="600">GPIO10</text><text class="small" x="685" y="600">LED stato active-low</text>
+  <text class="pin" x="592" y="650">GPIO11</text><text class="small" x="685" y="650">PWM gate MOSFET</text>
+  <text class="pin" x="592" y="700">GPIO18</text><text class="small" x="685" y="700">Reset OLED</text>
+  <text class="pin" x="592" y="755">3V3</text><text class="small" x="675" y="755">alimentazione partitori</text>
+  <text class="pin" x="790" y="755">GND</text>
+
+  <!-- NTC cold divider -->
+  <rect class="sensor" x="70" y="175" width="390" height="250"/>
+  <text class="txt" x="105" y="215">Partitore NTC freddo</text>
+  <text class="small" x="105" y="250">Resistenza fissa reale: 9.89 kΩ</text>
+  <text class="small" x="105" y="278">R fissa tra 3V3 e nodo ADC</text>
+  <text class="small" x="105" y="306">NTC 10k B3950 tra nodo ADC e GND</text>
+  <text class="small" x="105" y="344">Nodo centrale -> GPIO1</text>
+  <circle cx="420" cy="345" r="6" fill="#55d6ff"/>
+
+  <!-- NTC hot divider -->
+  <rect class="sensor" x="70" y="470" width="390" height="250"/>
+  <text class="txt" x="105" y="510">Partitore NTC caldo</text>
+  <text class="small" x="105" y="545">Stesso schema del freddo</text>
+  <text class="small" x="105" y="575">R fissa 9.89 kΩ verso 3V3</text>
+  <text class="small" x="105" y="603">NTC verso GND</text>
+  <text class="small" x="105" y="641">Nodo centrale -> GPIO2</text>
+  <circle cx="420" cy="642" r="6" fill="#55d6ff"/>
+
+  <!-- I2C sensors -->
+  <rect class="module" x="1090" y="155" width="420" height="250"/>
+  <text class="txt" x="1130" y="195">Bus I2C</text>
+  <text class="small" x="1130" y="232">SDA -> GPIO8</text>
+  <text class="small" x="1130" y="260">SCL -> GPIO9</text>
+  <text class="small" x="1130" y="298">OLED SSD1306 128x32, addr 0x3C</text>
+  <text class="small" x="1130" y="326">INA219 corrente/tensione Peltier</text>
+  <text class="small" x="1130" y="354">BME280 ambiente, addr 0x76/0x77</text>
+  <text class="small" x="1130" y="382">VCC moduli: 3V3 o 5V se compatibili</text>
+
+  <!-- MOSFET and Peltier -->
+  <rect class="warn" x="1090" y="475" width="420" height="320"/>
+  <text class="txt" x="1130" y="515">Modulo MOSFET + Peltier</text>
+  <text class="small" x="1130" y="552">GPIO11 -> IN / gate modulo MOSFET</text>
+  <text class="small" x="1130" y="580">GND ESP32 -> GND modulo MOSFET</text>
+  <text class="small" x="1130" y="620">Alimentatore Peltier + -> Peltier +</text>
+  <text class="small" x="1130" y="648">Peltier - -> drain / OUT MOSFET</text>
+  <text class="small" x="1130" y="676">source / GND MOSFET -> alimentatore -</text>
+  <text class="small" x="1130" y="716">A PWM 100%: gate circa 3.3V fisso</text>
+  <text class="small" x="1130" y="744">A PWM 50%: onda 0-3.3V a 20 kHz</text>
+
+  <!-- Power -->
+  <rect class="power" x="70" y="785" width="1440" height="165"/>
+  <text class="txt" x="105" y="825">Alimentazioni e masse</text>
+  <text class="small" x="105" y="862">3V3 ESP32-S2: alimenta i partitori NTC. Valore misurato usato nel firmware: 3.28V.</text>
+  <text class="small" x="105" y="895">VIN/5V ESP32-S2: alimentazione scheda. Se non parte da VIN, controllare rampa alimentazione / EN-RST / brownout.</text>
+  <text class="small" x="105" y="928">Alimentatore Peltier: separato ma con GND comune a ESP32 e modulo MOSFET. Dimensionare per corrente reale della Peltier.</text>
+
+  <!-- Wires NTC -->
+  <path class="wire3v3" d="M 900 755 C 700 830, 370 820, 210 360"/>
+  <path class="wire3v3" d="M 900 755 C 700 850, 370 820, 210 655"/>
+  <path class="wiregnd" d="M 835 755 C 610 820, 365 800, 250 390"/>
+  <path class="wiregnd" d="M 835 755 C 610 840, 365 805, 250 685"/>
+  <path class="wiresig" d="M 420 345 C 500 345, 520 310, 590 305" marker-end="url(#arrow)"/>
+  <path class="wiresig" d="M 420 642 C 500 642, 520 360, 590 355" marker-end="url(#arrow)"/>
+
+  <!-- Wires I2C -->
+  <path class="wirei2c" d="M 970 480 C 1030 480, 1050 235, 1090 235" marker-end="url(#arrow)"/>
+  <path class="wirei2c" d="M 970 530 C 1030 530, 1050 265, 1090 265" marker-end="url(#arrow)"/>
+  <path class="wiresig dash" d="M 970 700 C 1045 700, 1055 298, 1090 298" marker-end="url(#arrow)"/>
+
+  <!-- Wires MOSFET -->
+  <path class="wirepwm" d="M 970 650 C 1040 650, 1050 552, 1090 552" marker-end="url(#arrow)"/>
+  <path class="wiregnd" d="M 835 755 C 1040 820, 1050 580, 1090 580" marker-end="url(#arrow)"/>
+  <path class="wire12v" d="M 1240 785 L 1240 705" marker-end="url(#arrow)"/>
+  <path class="wiregnd" d="M 1320 785 L 1320 680" marker-end="url(#arrow)"/>
+
+  <!-- Legend -->
+  <rect class="module" x="70" y="980" width="1440" height="50"/>
+  <line class="wire3v3" x1="105" y1="1005" x2="165" y2="1005"/><text class="small" x="175" y="1012">3V3</text>
+  <line class="wiregnd" x1="260" y1="1005" x2="320" y2="1005"/><text class="small" x="330" y="1012">GND comune</text>
+  <line class="wiresig" x1="480" y1="1005" x2="540" y2="1005"/><text class="small" x="550" y="1012">ADC/segnale</text>
+  <line class="wirei2c" x1="720" y1="1005" x2="780" y2="1005"/><text class="small" x="790" y="1012">I2C</text>
+  <line class="wirepwm" x1="900" y1="1005" x2="960" y2="1005"/><text class="small" x="970" y="1012">PWM MOSFET</text>
+  <line class="wire12v" x1="1170" y1="1005" x2="1230" y2="1005"/><text class="small" x="1240" y="1012">Alimentazione Peltier</text>
+</svg>
