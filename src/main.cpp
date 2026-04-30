@@ -298,6 +298,8 @@ bool ambientSensorPresent = false;
 bool ina219Present = false;
 bool wifiConnectedLogged = false;
 bool statusLedOn = false;
+uint8_t i2cDeviceCount = 0;
+String i2cScanSummary = "non eseguita";
 time_t bootEpoch = 0;
 
 void writeStatusLed(const bool on) {
@@ -440,14 +442,23 @@ bool hasWifiCredentials() {
 void scanI2cBus() {
   Serial.println("Scan I2C iniziale...");
   uint8_t found = 0;
+  String summary;
   for (uint8_t address = 1; address < 127; ++address) {
     Wire.beginTransmission(address);
     if (Wire.endTransmission() == 0) {
       Serial.printf("  I2C trovato: 0x%02X\n", address);
+      if (!summary.isEmpty()) {
+        summary += ", ";
+      }
+      char buffer[6];
+      snprintf(buffer, sizeof(buffer), "0x%02X", address);
+      summary += buffer;
       ++found;
     }
     delay(2);
   }
+  i2cDeviceCount = found;
+  i2cScanSummary = found > 0 ? summary : String("nessuna periferica rilevata");
   if (found == 0) {
     Serial.println("  Nessuna periferica I2C rilevata");
   }
@@ -980,6 +991,8 @@ void appendStatusJson(JsonDocument& doc) {
   debug["peltier_trend_power_pct"] = debugState.peltierTrendPowerPct;
   debug["temperature_filter_alpha"] = NTC_TEMP_FILTER_ALPHA;
   debug["adc_sample_count"] = NTC_ADC_SAMPLE_COUNT;
+  debug["i2c_device_count"] = i2cDeviceCount;
+  debug["i2c_scan"] = i2cScanSummary;
 
   JsonObject pid = doc["pid"].to<JsonObject>();
   pid["kp"] = pidConfig.kp;
@@ -1643,7 +1656,9 @@ void handleRoot() {
   html += F("<div class='card'><h2>Calibrazioni</h2><div class='row'><div><label>Offset freddo</label><div class='uf'><input id='cold_offset_c' type='number' step='0.1'><span>°C</span></div></div><div><label>Offset caldo</label><div class='uf'><input id='hot_offset_c' type='number' step='0.1'><span>°C</span></div></div></div><div class='row'><div><label>Offset ambiente</label><div class='uf'><input id='ambient_offset_c' type='number' step='0.1'><span>°C</span></div></div><div><label>Offset umidita</label><div class='uf'><input id='humidity_offset_pct' type='number' step='0.1'><span>%</span></div></div></div><div class='row'><div><label>Offset corrente</label><div class='uf'><input id='current_offset_a' type='number' step='0.01'><span>A</span></div></div><div><label>Scala corrente</label><div class='uf'><input id='current_scale' type='number' step='0.01'><span>x</span></div></div></div><div class='actions'><div><button onclick='saveCalibration()'>Salva calibrazioni</button></div><div></div></div></div>");
   html += F("<div class='card'><h2>Preimpostazioni</h2><label title='Profili operativi salvati'>Preset</label><select id='preset_name' title='Profili operativi salvati'><option value='estate'>Estate</option><option value='inverno'>Inverno</option><option value='deep_cooling'>Deep cooling</option></select><div class='mini' id='presetInfo' style='margin-top:18px;display:grid;grid-template-columns:1fr auto;gap:8px 18px'><div>Target</div><div>--</div><div>Dew margin</div><div>--</div><div>Duty max</div><div>--</div></div><div class='actions'><div><button onclick='applyPreset()' title='Carica la preimpostazione selezionata nella configurazione attiva'>Applica preset</button></div><div class='right'><button class='alt' onclick='savePreset()' title='Sovrascrive la preimpostazione selezionata con la configurazione attuale'>Salva preset corrente</button></div></div></div>");
   html += F("<div class='card'><h2>Statistiche</h2><div class='mini diag'><div>WiFi signal</div><div id='wifiRssi'>--</div><div>BSSID</div><div id='wifiBssid'>--</div><div>IP</div><div id='boardIp'>--</div><div>BLE</div><div id='bleState'>--</div><div>Free RAM</div><div id='freeHeap'>--</div><div>CPU temp</div><div id='cpuTemp'>--</div><div>Avvio</div><div id='bootTime'>--</div></div></div>");
-  html += F("<div class='card wide'><h2>Debug</h2><div class='row'><div><label>Override PWM manuale</label><select id='debug_manual_pwm_enabled'><option value='false'>Disabilitato</option><option value='true'>Abilitato</option></select></div><div><label>Duty manuale</label><div class='uf'><input id='debug_manual_pwm_pct' type='number' step='1' min='0' max='100'><span>%</span></div></div></div><div class='actions'><div><button class='warn' onclick='applyDebugPwm()'>Applica PWM manuale</button><button class='alt' onclick='stopDebugPwm()'>Disattiva debug PWM</button><button class='alt' onclick='resetDebugMinMax()'>Reset min/max temp</button></div><div class='right mini'>Runtime only: non salvato in flash. La protezione lato caldo resta attiva.</div></div><div class='mini diag' style='margin-top:12px'><div>PWM manuale attivo</div><div id='debugManualState'>--</div><div>Duty manuale impostato</div><div id='debugManualDuty'>--</div><div>PWM realmente applicato</div><div id='debugAppliedPwm'>--</div><div>Freddo min/max</div><div id='debugColdMinMax'>--</div><div>Caldo min/max</div><div id='debugHotMinMax'>--</div></div><div class='mini debugDiag' id='debugReadings' style='margin-top:14px'></div></div>");
+  html += F("<div class='card wide'><h2>Debug</h2><div class='row'><div><label>Override PWM manuale</label><select id='debug_manual_pwm_enabled'><option value='false'>Disabilitato</option><option value='true'>Abilitato</option></select></div><div><label>Duty manuale</label><div class='uf'><input id='debug_manual_pwm_pct' type='number' step='1' min='0' max='100'><span>%</span></div></div></div><div class='actions'><div><button class='warn' onclick='applyDebugPwm()'>Applica PWM manuale</button><button class='alt' onclick='stopDebugPwm()'>Disattiva debug PWM</button><button class='alt' onclick='resetDebugMinMax()'>Reset min/max temp</button></div><div class='right mini'>Runtime only: non salvato in flash. La protezione lato caldo resta attiva.</div></div><div class='mini diag' style='margin-top:12px'><div>PWM manuale attivo</div><div id='debugManualState'>--</div><div>Duty manuale impostato</div><div id='debugManualDuty'>--</div><div>PWM realmente applicato</div><div id='debugAppliedPwm'>--</div><div>Freddo min/max</div><div id='debugColdMinMax'>--</div><div>Caldo min/max</div><div id='debugHotMinMax'>--</div><div>I2C scan</div><div>");
+  html += i2cScanSummary;
+  html += F("</div></div><div class='mini debugDiag' id='debugReadings' style='margin-top:14px'></div></div>");
   html += F("<script>function fmt(v,u=''){const n=Number(v);return Number.isFinite(n)?n.toFixed(2)+u:'--'}function boolVal(id){return document.getElementById(id).value==='true'}function numVal(id){return parseFloat(document.getElementById(id).value)}"
             "const HIST_MAX=2160;const HIST_STEP_S=20;const hist={cold:[],hot:[],ambient:[],power:[],t:[]};let lastHistS=-999;let chartGeom=null;let hotEnabled=false;let chartWindowS=14400;function pushHistSample(j){const nowS=Math.floor((j.board.uptime_s||0));if(nowS-lastHistS<HIST_STEP_S&&hist.t.length)return;lastHistS=nowS;const map={cold:j.sensor.cold_c,hot:j.sensor.hot_c,ambient:j.sensor.ambient_c,power:j.control.pwm_duty*100,t:nowS};Object.keys(map).forEach(k=>{hist[k].push(Number(map[k]));if(hist[k].length>HIST_MAX)hist[k].shift()})}function fillField(id,v){const el=document.getElementById(id);const n=Number(v);if(el&&Number.isFinite(n))el.value=n}function fillBool(id,v){const el=document.getElementById(id);if(el)el.value=v?'true':'false'}function setHotVisibility(on){hotEnabled=!!on;document.querySelectorAll('.hotOnly').forEach(el=>el.style.display=hotEnabled?'':'none')}"
             "async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});return await r.json()}"
