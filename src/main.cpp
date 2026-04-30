@@ -1,7 +1,14 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <Adafruit_ADS1X15.h>
+#ifndef USE_SHT30
+#define USE_SHT30 1
+#endif
+#if USE_SHT30
+#include <Adafruit_SHT31.h>
+#else
 #include <Adafruit_BME280.h>
+#endif
 #include <Adafruit_INA219.h>
 #if BOARD_LOLIN_S2_PICO
 #include <Adafruit_SSD1306.h>
@@ -204,6 +211,7 @@ struct SensorState {
   float adc32VoltageV = NAN;
   float adc33VoltageV = NAN;
   float adc34VoltageV = NAN;
+  bool ambientSensorOk = false;
   bool bmeOk = false;
   bool inaOk = false;
   bool adsOk = false;
@@ -251,7 +259,11 @@ ControlState controlState;
 DebugState debugState;
 
 Preferences preferences;
+#if USE_SHT30
+Adafruit_SHT31 ambientSensor = Adafruit_SHT31();
+#else
 Adafruit_BME280 bme;
+#endif
 Adafruit_INA219 ina219;
 Adafruit_ADS1115 ads;
 #if BOARD_LOLIN_S2_PICO
@@ -282,7 +294,7 @@ bool pidHasHistory = false;
 bool mdnsStarted = false;
 bool captivePortalActive = false;
 bool ntpConfigured = false;
-bool bmePresent = false;
+bool ambientSensorPresent = false;
 bool ina219Present = false;
 bool wifiConnectedLogged = false;
 bool statusLedOn = false;
@@ -797,14 +809,21 @@ void refreshSensors() {
   updateDebugTemperatureMinMax();
   updateDebugTemperatureTrend();
 
-  if (bmePresent) {
+  if (ambientSensorPresent) {
+#if USE_SHT30
+    const float ambientC = ambientSensor.readTemperature();
+    const float humidity = ambientSensor.readHumidity();
+#else
     const float ambientC = bme.readTemperature();
     const float humidity = bme.readHumidity();
-    sensorState.bmeOk = isfinite(ambientC) && isfinite(humidity) && humidity >= 0.0f && humidity <= 100.0f;
-    sensorState.ambientC = sensorState.bmeOk ? ambientC + calibration.ambientTempOffsetC : NAN;
-    sensorState.humidityPct = sensorState.bmeOk ? clampf(humidity + calibration.humidityOffsetPct, 0.0f, 100.0f) : NAN;
-    sensorState.dewPointC = sensorState.bmeOk ? computeDewPointC(sensorState.ambientC, sensorState.humidityPct) : NAN;
+#endif
+    sensorState.ambientSensorOk = isfinite(ambientC) && isfinite(humidity) && humidity >= 0.0f && humidity <= 100.0f;
+    sensorState.bmeOk = sensorState.ambientSensorOk;
+    sensorState.ambientC = sensorState.ambientSensorOk ? ambientC + calibration.ambientTempOffsetC : NAN;
+    sensorState.humidityPct = sensorState.ambientSensorOk ? clampf(humidity + calibration.humidityOffsetPct, 0.0f, 100.0f) : NAN;
+    sensorState.dewPointC = sensorState.ambientSensorOk ? computeDewPointC(sensorState.ambientC, sensorState.humidityPct) : NAN;
   } else {
+    sensorState.ambientSensorOk = false;
     sensorState.bmeOk = false;
     sensorState.ambientC = NAN;
     sensorState.humidityPct = NAN;
@@ -928,6 +947,8 @@ void appendStatusJson(JsonDocument& doc) {
   sensor["adc34_voltage_v"] = sensorState.adc34VoltageV;
   sensor["cold_ntc_ok"] = sensorState.coldNtcOk;
   sensor["hot_ntc_ok"] = sensorState.hotNtcOk;
+  sensor["ambient_sensor_type"] = USE_SHT30 ? "sht30" : "bme280";
+  sensor["ambient_sensor_ok"] = sensorState.ambientSensorOk;
   sensor["bme280_ok"] = sensorState.bmeOk;
   sensor["ina219_ok"] = sensorState.inaOk;
   sensor["ads1115_ok"] = sensorState.adsOk;
@@ -1615,7 +1636,7 @@ void handleRoot() {
             "@media(max-width:640px){.row{grid-template-columns:1fr}.hero{flex-direction:column;align-items:flex-start}}</style></head><body>");
 #endif
   html += F("<div class='wrap'><div class='hero'><div><h1>ZWO ASI Smart Cooler</h1><div class='meta'>Firmware <span id='fwVersion'>--</span> | <a id='projectLink' href='#' target='_blank' style='color:#8fc7ff'>https://github.com/naamah75/asi-smart-cooler-diy</a></div></div><div><button onclick='refreshStatus()'>Aggiorna</button></div></div>");
-  html += F("<div class='grid'><div class='card wide'><h2>Stato</h2><div class='statusGrid'><div class='statusItem' title='Temperatura misurata sul lato freddo vicino all interfaccia termica della camera'><div class='metric' id='coldMetric'>--</div><div class='meta'>Lato freddo</div></div><div class='statusItem hotOnly' title='Temperatura misurata sul dissipatore lato caldo'><div class='metric' id='hotMetric'>--</div><div class='meta'>Lato caldo</div></div><div class='statusItem' title='Temperatura dell aria ambiente letta dal sensore BME280'><div class='metric' id='ambientMetric'>--</div><div class='meta'>Ambiente</div></div><div class='statusItem' title='Punto di rugiada calcolato da temperatura e umidita ambiente'><div class='metric' id='dewMetric'>--</div><div class='meta'>Dew point</div></div><div class='statusItem' title='Corrente assorbita dalla cella di Peltier misurata dal sensore di corrente configurato'><div class='metric' id='currentMetric'>--</div><div class='meta'>Corrente</div></div><div class='statusItem' title='Duty PWM attualmente applicato al MOSFET che pilota la Peltier'><div class='metric' id='dutyMetric'>--</div><div class='meta'>Duty PWM</div></div></div></div>");
+  html += F("<div class='grid'><div class='card wide'><h2>Stato</h2><div class='statusGrid'><div class='statusItem' title='Temperatura misurata sul lato freddo vicino all interfaccia termica della camera'><div class='metric' id='coldMetric'>--</div><div class='meta'>Lato freddo</div></div><div class='statusItem hotOnly' title='Temperatura misurata sul dissipatore lato caldo'><div class='metric' id='hotMetric'>--</div><div class='meta'>Lato caldo</div></div><div class='statusItem' title='Temperatura dell aria ambiente letta dal sensore ambiente I2C configurato'><div class='metric' id='ambientMetric'>--</div><div class='meta'>Ambiente</div></div><div class='statusItem' title='Punto di rugiada calcolato da temperatura e umidita ambiente'><div class='metric' id='dewMetric'>--</div><div class='meta'>Dew point</div></div><div class='statusItem' title='Corrente assorbita dalla cella di Peltier misurata dal sensore di corrente configurato'><div class='metric' id='currentMetric'>--</div><div class='meta'>Corrente</div></div><div class='statusItem' title='Duty PWM attualmente applicato al MOSFET che pilota la Peltier'><div class='metric' id='dutyMetric'>--</div><div class='meta'>Duty PWM</div></div></div></div>");
   html += F("<div class='card wide'><h2>Grafici</h2><div class='chartWrap'><div class='chartLegend'><div class='legendItem'><span class='sw' style='background:#55d6ff'></span><span>Lato freddo</span></div><div class='legendItem hotOnly'><span class='sw' style='background:#ff8f6b'></span><span>Lato caldo</span></div><div class='legendItem'><span class='sw' style='background:#6ee7b7'></span><span>Ambiente</span></div><div class='legendItem'><span class='sw' style='background:#3a86ff'></span><span>Potenza Peltier</span></div><div class='chartControls'><span>Scala</span><select id='chart_window'><option value='900'>15 min</option><option value='3600'>1 ora</option><option value='14400' selected>4 ore</option><option value='43200'>12 ore</option></select></div></div><canvas id='trendChart' width='1000' height='240'></canvas></div></div>");
   html += F("<div class='card'><h2>Controllo</h2><div class='row'><div><label title='Setpoint richiesto per il lato freddo'>Target freddo</label><div class='uf'><input id='target_c' type='number' step='0.1' title='Setpoint richiesto per il lato freddo'><span>°C</span></div></div><div><label title='Margine minimo di sicurezza sopra il dew point'>Margine dewp</label><div class='uf'><input id='dew_margin_c' type='number' step='0.1' title='Margine minimo di sicurezza sopra il dew point'><span>°C</span></div></div></div><div class='row'><div><label title='Limite massimo normalizzato del duty PWM della Peltier'>Duty max</label><div class='uf'><input id='max_duty' type='number' step='0.01' min='0' max='1' title='Limite massimo normalizzato del duty PWM della Peltier'><span>x</span></div></div><div class='hotOnly'><label title='Soglia di spegnimento per protezione lato caldo'>T. max caldo</label><div class='uf'><input id='max_hot_side_c' type='number' step='0.1' title='Soglia di spegnimento per protezione lato caldo'><span>°C</span></div></div></div><div class='row'><div><label title='Abilita o disabilita il raffreddamento in anello chiuso'>Controllo</label><select id='enabled' title='Abilita o disabilita il raffreddamento in anello chiuso'><option value='true'>Abilitato</option><option value='false'>Disabilitato</option></select></div><div></div></div><div class='actions'><div><button onclick='saveConfig()' title='Salva i parametri di controllo correnti'>Salva controllo</button></div><div class='right'><button class='warn' onclick='disableCooler()' title='Ferma immediatamente l uscita verso la Peltier'>Stop</button></div></div></div>");
   html += F("<div class='card'><h2>PID</h2><div class='row'><div><label>Kp</label><input id='kp' type='number' step='0.01'></div><div><label>Ki</label><input id='ki' type='number' step='0.01'></div></div><div class='row'><div><label>Kd</label><input id='kd' type='number' step='0.01'></div><div><label>Profilo rapido</label><select id='pid_profile'><option value='manual'>Manuale</option><option value='soft'>Soft</option><option value='normal'>Normal</option><option value='aggressive'>Aggressive</option></select></div></div><div class='actions'><div><button class='alt' onclick='applyBaseTune()'>Calibrazione PID</button></div><div class='right'><button onclick='savePid()'>Salva PID</button></div></div></div>");
@@ -1957,8 +1978,14 @@ void setupSensors() {
 #endif
   Serial.printf("Pin NTC: freddo=GPIO%u caldo=GPIO%u\n", pins::COLD_NTC_ADC, pins::HOT_NTC_ADC);
   scanI2cBus();
-  bmePresent = bme.begin(0x76) || bme.begin(0x77);
-  sensorState.bmeOk = bmePresent;
+#if USE_SHT30
+  ambientSensorPresent = ambientSensor.begin(0x44) || ambientSensor.begin(0x45);
+#else
+  ambientSensorPresent = bme.begin(0x76) || bme.begin(0x77);
+#endif
+  sensorState.ambientSensorOk = ambientSensorPresent;
+  sensorState.bmeOk = ambientSensorPresent;
+  Serial.printf("Sensore ambiente: %s %s\n", USE_SHT30 ? "SHT30" : "BME280", ambientSensorPresent ? "OK" : "non trovato");
 
 #if USE_ADS1115
   sensorState.adsOk = ads.begin();

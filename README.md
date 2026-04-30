@@ -12,7 +12,7 @@ Target hardware attuale: `Wemos/LOLIN S2 Pico`, con supporto anche per `Wemos/LO
 - Override anti-condensa: il target non scende sotto `dew point + margine`
 - Lettura NTC 10K B3950 sulla parte fredda
 - Sensore NTC 10K B3950 opzionale sul lato caldo con cutoff di sicurezza
-- Lettura temperatura/umidita ambiente da BME280
+- Lettura temperatura/umidita ambiente da SHT30/SHT31 o BME280
 - Calcolo dew point
 - Lettura corrente e tensione Peltier via INA219
 - Calibrazioni persistenti salvate in `Preferences`
@@ -66,6 +66,7 @@ Environment disponibili:
 - `lolin_d32_pro_ads1115_ina219_classic`
 - `lolin_d32_pro_ads1115_acs71x_classic`
 - `lolin_s2_pico_espadc_ina219`
+- `lolin_s2_pico_espadc_ina219_bme280`
 
 Configurazione consigliata di default per partire:
 
@@ -85,12 +86,16 @@ Significato:
 - `ads1115`: NTC e ingressi analogici letti tramite ADC I2C esterno ADS1115
 - `ina219`: corrente letta via INA219 su I2C
 - `acs71x`: corrente letta con sensore Hall analogico tipo ACS71x
+- `USE_SHT30=1`: sensore ambiente SHT30/SHT31 su I2C, default attuale
+- `USE_SHT30=0`: sensore ambiente BME280 su I2C
 
 Nota importante:
 
 - se usi `ADS1115 + ACS71x`, tutte le letture analogiche del progetto passano da ADS1115
 - quindi NTC freddo, NTC caldo e sensore corrente ACS71x vengono tutti letti dal convertitore I2C
 - se usi `ADS1115 + INA219`, ADS1115 legge solo le sonde NTC, mentre la corrente resta letta da INA219
+- l'environment `lolin_s2_pico_espadc_ina219` usa SHT30/SHT31 come sensore ambiente di default
+- l'environment `lolin_s2_pico_espadc_ina219_bme280` mantiene la variante con BME280
 
 ### Valori tipici ACS71x
 
@@ -116,7 +121,7 @@ In molti moduli analogici alimentati a `3.3V`, `ACS_ZERO_V` puo partire da circa
 - ADC letto sul nodo centrale del partitore
 - Il sensore caldo usa lo stesso schema del sensore freddo
 - INA219 sul bus I2C della Peltier
-- BME280 sullo stesso bus I2C a `0x76` o `0x77`
+- SHT30/SHT31 sullo stesso bus I2C a `0x44` o `0x45`, oppure BME280 a `0x76` o `0x77` se compilato con `USE_SHT30=0`
 - MOSFET logic level comandato direttamente da ESP32 con adeguato driver/pull-down se necessario
 
 ## Taratura NTC e ADC ESP32-S2
@@ -155,6 +160,14 @@ Se un offset e gia stato salvato dalla UI, il valore salvato in flash prevale su
 Per l'involucro della camera, della Peltier e del dissipatore con ventola e disponibile un modello stampabile in 3D su Thingiverse:
 
 - https://www.thingiverse.com/thing:5873931
+
+## Documentazione hardware
+
+La cartella `docs/` contiene i file di supporto per realizzare il cablaggio e il contenitore:
+
+- `docs/wiring_esp32s2.svg`: schema dei collegamenti per LOLIN S2 Pico, sensori NTC, bus I2C, INA219, sensore ambiente, OLED e pilotaggio MOSFET della Peltier.
+- `docs/asi-smart-cooler-diy.fzz`: progetto Fritzing dello schema hardware, utile per consultare o modificare il cablaggio elettronico.
+- `docs/scatola_rugged_peltier_v6.scad`: modello OpenSCAD del contenitore rugged stampabile in 3D, con corpo e coperchio separati.
 
 ## Configurazione WiFi
 
@@ -392,8 +405,8 @@ Ordine di tentativo lato bridge:
 
 - `cold_offset_c`: correzione della sonda NTC fredda
 - `hot_offset_c`: correzione della sonda NTC calda opzionale
-- `ambient_offset_c`: correzione temperatura BME280
-- `humidity_offset_pct`: correzione umidita BME280
+- `ambient_offset_c`: correzione temperatura del sensore ambiente SHT30/SHT31 o BME280
+- `humidity_offset_pct`: correzione umidita del sensore ambiente SHT30/SHT31 o BME280
 - `current_offset_a`: offset della corrente INA219
 - `current_scale`: guadagno moltiplicativo della corrente INA219
 
