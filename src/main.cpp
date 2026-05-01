@@ -51,6 +51,10 @@
 #define ACS_ZERO_V 1.65f
 #endif
 
+#ifndef INA219_SHUNT_RESISTOR_OHM
+#define INA219_SHUNT_RESISTOR_OHM 0.1f
+#endif
+
 #ifndef THEME_RETRO_AMBER
 #define THEME_RETRO_AMBER 1
 #endif
@@ -150,7 +154,7 @@ struct ControlConfig {
   bool hotSensorEnabled = false;
   float targetC = 5.0f;
   float dewMarginC = 2.0f;
-  float maxDuty = 0.90f;
+  float maxDuty = 1.0f;
   float maxHotSideC = 55.0f;
 };
 
@@ -170,7 +174,7 @@ struct CurrentSensorConfig {
 struct PresetConfig {
   float targetC = 5.0f;
   float dewMarginC = 2.0f;
-  float maxDuty = 0.90f;
+  float maxDuty = 1.0f;
   float maxHotSideC = 55.0f;
   bool hotSensorEnabled = false;
 };
@@ -196,6 +200,7 @@ struct SensorState {
   float dewPointC = NAN;
   float currentA = NAN;
   float busVoltageV = NAN;
+  float shuntVoltageMv = NAN;
   float coldNtcVoltageV = NAN;
   float hotNtcVoltageV = NAN;
   float coldNtcResistanceOhm = NAN;
@@ -579,8 +584,9 @@ float computeDewPointC(const float temperatureC, const float humidityPct) {
   return (b * gamma) / (a - gamma);
 }
 
-void setPwmDuty(const float duty) {
-  controlState.pwmDuty = clampf(duty, 0.0f, controlConfig.maxDuty);
+void setPwmDuty(const float duty, const bool bypassMaxDuty = false) {
+  const float maxDuty = bypassMaxDuty ? 1.0f : controlConfig.maxDuty;
+  controlState.pwmDuty = clampf(duty, 0.0f, maxDuty);
   const uint32_t rawDuty = static_cast<uint32_t>(roundf(controlState.pwmDuty * pwm::MAX_DUTY));
   ledcWrite(pwm::CHANNEL, rawDuty);
 }
@@ -736,7 +742,7 @@ void loadPreferences() {
 
   presetDeepCooling.targetC = -5.0f;
   presetDeepCooling.dewMarginC = 3.0f;
-  presetDeepCooling.maxDuty = 0.90f;
+  presetDeepCooling.maxDuty = 1.0f;
   presetDeepCooling.maxHotSideC = 52.0f;
   presetDeepCooling.hotSensorEnabled = true;
 
@@ -861,10 +867,12 @@ void refreshSensors() {
   sensorState.busVoltageV = NAN;
 #else
   if (ina219Present) {
-    const float currentA = ina219.getCurrent_mA() / 1000.0f;
+    const float shuntVoltageMv = ina219.getShuntVoltage_mV();
     const float busVoltage = ina219.getBusVoltage_V();
-    sensorState.inaOk = isfinite(currentA) && isfinite(busVoltage);
+    const float currentA = (shuntVoltageMv / 1000.0f) / INA219_SHUNT_RESISTOR_OHM;
+    sensorState.inaOk = isfinite(currentA) && isfinite(busVoltage) && isfinite(shuntVoltageMv);
     sensorState.currentOk = sensorState.inaOk;
+    sensorState.shuntVoltageMv = sensorState.inaOk ? shuntVoltageMv : NAN;
     sensorState.currentA = sensorState.inaOk ? (currentA * calibration.currentScale) + calibration.currentOffsetA : NAN;
     sensorState.busVoltageV = sensorState.inaOk ? busVoltage : NAN;
   } else {
@@ -872,6 +880,7 @@ void refreshSensors() {
     sensorState.currentOk = false;
     sensorState.currentA = NAN;
     sensorState.busVoltageV = NAN;
+    sensorState.shuntVoltageMv = NAN;
   }
 #endif
 }
@@ -892,7 +901,7 @@ void updateControl(const float dtSeconds) {
     controlState.effectiveTargetC = controlConfig.targetC;
     controlState.dewClampActive = false;
     controlState.pidOutput = debugState.manualPwmDuty * 100.0f;
-    setPwmDuty(debugState.manualPwmDuty);
+    setPwmDuty(debugState.manualPwmDuty, true);
     resetPid();
     return;
   }
@@ -941,6 +950,7 @@ void appendStatusJson(JsonDocument& doc) {
   sensor["dew_point_c"] = sensorState.dewPointC;
   sensor["current_a"] = sensorState.currentA;
   sensor["bus_voltage_v"] = sensorState.busVoltageV;
+  sensor["shunt_voltage_mv"] = sensorState.shuntVoltageMv;
   sensor["cold_ntc_voltage_v"] = sensorState.coldNtcVoltageV;
   sensor["hot_ntc_voltage_v"] = sensorState.hotNtcVoltageV;
   sensor["cold_ntc_ohm"] = sensorState.coldNtcResistanceOhm;
@@ -1182,6 +1192,36 @@ void logStatusToSerial() {
 bool applyJsonConfig(const JsonDocument& doc, String& message) {
   bool changed = false;
   bool debugChanged = false;
+  const auto tryParseNumber = [&](const JsonVariantConst& value, float& outValue) {
+    if (value.isNull()) {
+      return false;
+    }
+    if (value.is<int>() || value.is<float>() || value.is<double>()) {
+      outValue = value.as<float>();
+      return true;
+    }
+
+    String normalized = value.as<String>();
+    normalized.trim();
+    if (normalized.startsWith("\"") && normalized.endsWith("\"") && normalized.length() >= 2) {
+      normalized = normalized.substring(1, normalized.length() - 1);
+      normalized.trim();
+    }
+    normalized.replace(',', '.');
+    if (normalized.isEmpty()) {
+      return false;
+    }
+
+    char* endPtr = nullptr;
+    const float parsed = strtof(normalized.c_str(), &endPtr);
+    if (endPtr == normalized.c_str() || (endPtr != nullptr && *endPtr != '\0')) {
+      return false;
+    }
+    outValue = parsed;
+    return true;
+  };
+
+  float parsedValue = 0.0f;
 
   if (doc["enabled"].is<bool>()) {
     controlConfig.enabled = doc["enabled"].as<bool>();
@@ -1191,20 +1231,20 @@ bool applyJsonConfig(const JsonDocument& doc, String& message) {
     controlConfig.hotSensorEnabled = doc["hot_sensor_enabled"].as<bool>();
     changed = true;
   }
-  if (doc["target_c"].is<float>() || doc["target_c"].is<int>()) {
-    controlConfig.targetC = doc["target_c"].as<float>();
+  if (tryParseNumber(doc["target_c"], parsedValue)) {
+    controlConfig.targetC = parsedValue;
     changed = true;
   }
-  if (doc["dew_margin_c"].is<float>() || doc["dew_margin_c"].is<int>()) {
-    controlConfig.dewMarginC = clampf(doc["dew_margin_c"].as<float>(), 0.0f, 20.0f);
+  if (tryParseNumber(doc["dew_margin_c"], parsedValue)) {
+    controlConfig.dewMarginC = clampf(parsedValue, 0.0f, 20.0f);
     changed = true;
   }
-  if (doc["max_duty"].is<float>() || doc["max_duty"].is<int>()) {
-    controlConfig.maxDuty = clampf(doc["max_duty"].as<float>(), 0.0f, 1.0f);
+  if (tryParseNumber(doc["max_duty"], parsedValue)) {
+    controlConfig.maxDuty = clampf(parsedValue, 0.0f, 1.0f);
     changed = true;
   }
-  if (doc["max_hot_side_c"].is<float>() || doc["max_hot_side_c"].is<int>()) {
-    controlConfig.maxHotSideC = clampf(doc["max_hot_side_c"].as<float>(), 20.0f, 100.0f);
+  if (tryParseNumber(doc["max_hot_side_c"], parsedValue)) {
+    controlConfig.maxHotSideC = clampf(parsedValue, 20.0f, 100.0f);
     changed = true;
   }
 
@@ -1219,16 +1259,16 @@ bool applyJsonConfig(const JsonDocument& doc, String& message) {
 
   if (doc["pid"].is<JsonObject>()) {
     const JsonObjectConst pid = doc["pid"].as<JsonObjectConst>();
-    if (pid["kp"].is<float>() || pid["kp"].is<int>()) {
-      pidConfig.kp = pid["kp"].as<float>();
+    if (tryParseNumber(pid["kp"], parsedValue)) {
+      pidConfig.kp = parsedValue;
       changed = true;
     }
-    if (pid["ki"].is<float>() || pid["ki"].is<int>()) {
-      pidConfig.ki = pid["ki"].as<float>();
+    if (tryParseNumber(pid["ki"], parsedValue)) {
+      pidConfig.ki = parsedValue;
       changed = true;
     }
-    if (pid["kd"].is<float>() || pid["kd"].is<int>()) {
-      pidConfig.kd = pid["kd"].as<float>();
+    if (tryParseNumber(pid["kd"], parsedValue)) {
+      pidConfig.kd = parsedValue;
       changed = true;
     }
     if (changed) {
@@ -1243,13 +1283,13 @@ bool applyJsonConfig(const JsonDocument& doc, String& message) {
       changed = true;
       debugChanged = true;
     }
-    if (debug["manual_pwm_duty"].is<float>() || debug["manual_pwm_duty"].is<int>()) {
-      debugState.manualPwmDuty = clampf(debug["manual_pwm_duty"].as<float>(), 0.0f, 1.0f);
+    if (tryParseNumber(debug["manual_pwm_duty"], parsedValue)) {
+      debugState.manualPwmDuty = clampf(parsedValue, 0.0f, 1.0f);
       changed = true;
       debugChanged = true;
     }
-    if (debug["manual_pwm_pct"].is<float>() || debug["manual_pwm_pct"].is<int>()) {
-      debugState.manualPwmDuty = clampf(debug["manual_pwm_pct"].as<float>() / 100.0f, 0.0f, 1.0f);
+    if (tryParseNumber(debug["manual_pwm_pct"], parsedValue)) {
+      debugState.manualPwmDuty = clampf(parsedValue / 100.0f, 0.0f, 1.0f);
       changed = true;
       debugChanged = true;
     }
@@ -1265,13 +1305,13 @@ bool applyJsonConfig(const JsonDocument& doc, String& message) {
     changed = true;
     debugChanged = true;
   }
-  if (doc["manual_pwm_duty"].is<float>() || doc["manual_pwm_duty"].is<int>()) {
-    debugState.manualPwmDuty = clampf(doc["manual_pwm_duty"].as<float>(), 0.0f, 1.0f);
+  if (tryParseNumber(doc["manual_pwm_duty"], parsedValue)) {
+    debugState.manualPwmDuty = clampf(parsedValue, 0.0f, 1.0f);
     changed = true;
     debugChanged = true;
   }
-  if (doc["manual_pwm_pct"].is<float>() || doc["manual_pwm_pct"].is<int>()) {
-    debugState.manualPwmDuty = clampf(doc["manual_pwm_pct"].as<float>() / 100.0f, 0.0f, 1.0f);
+  if (tryParseNumber(doc["manual_pwm_pct"], parsedValue)) {
+    debugState.manualPwmDuty = clampf(parsedValue / 100.0f, 0.0f, 1.0f);
     changed = true;
     debugChanged = true;
   }
@@ -1281,30 +1321,31 @@ bool applyJsonConfig(const JsonDocument& doc, String& message) {
     changed = true;
   }
 
-  if (doc["calibration"].is<JsonObject>()) {
-    const JsonObjectConst cal = doc["calibration"].as<JsonObjectConst>();
-    if (cal["cold_offset_c"].is<float>() || cal["cold_offset_c"].is<int>()) {
-      calibration.coldOffsetC = cal["cold_offset_c"].as<float>();
+  const JsonVariantConst calibrationNode = doc["calibration"];
+  if (!calibrationNode.isNull()) {
+    const JsonVariantConst cal = calibrationNode;
+    if (tryParseNumber(cal["cold_offset_c"], parsedValue)) {
+      calibration.coldOffsetC = clampf(parsedValue, -5.0f, 5.0f);
       changed = true;
     }
-    if (cal["hot_offset_c"].is<float>() || cal["hot_offset_c"].is<int>()) {
-      calibration.hotOffsetC = cal["hot_offset_c"].as<float>();
+    if (tryParseNumber(cal["hot_offset_c"], parsedValue)) {
+      calibration.hotOffsetC = clampf(parsedValue, -5.0f, 5.0f);
       changed = true;
     }
-    if (cal["ambient_offset_c"].is<float>() || cal["ambient_offset_c"].is<int>()) {
-      calibration.ambientTempOffsetC = cal["ambient_offset_c"].as<float>();
+    if (tryParseNumber(cal["ambient_offset_c"], parsedValue)) {
+      calibration.ambientTempOffsetC = clampf(parsedValue, -5.0f, 5.0f);
       changed = true;
     }
-    if (cal["humidity_offset_pct"].is<float>() || cal["humidity_offset_pct"].is<int>()) {
-      calibration.humidityOffsetPct = cal["humidity_offset_pct"].as<float>();
+    if (tryParseNumber(cal["humidity_offset_pct"], parsedValue)) {
+      calibration.humidityOffsetPct = clampf(parsedValue, -10.0f, 10.0f);
       changed = true;
     }
-    if (cal["current_offset_a"].is<float>() || cal["current_offset_a"].is<int>()) {
-      calibration.currentOffsetA = cal["current_offset_a"].as<float>();
+    if (tryParseNumber(cal["current_offset_a"], parsedValue)) {
+      calibration.currentOffsetA = parsedValue;
       changed = true;
     }
-    if (cal["current_scale"].is<float>() || cal["current_scale"].is<int>()) {
-      calibration.currentScale = cal["current_scale"].as<float>();
+    if (tryParseNumber(cal["current_scale"], parsedValue)) {
+      calibration.currentScale = parsedValue;
       changed = true;
     }
   }
@@ -1318,7 +1359,7 @@ bool applyJsonConfig(const JsonDocument& doc, String& message) {
     resetPid();
     controlState.dewClampActive = false;
     controlState.pidOutput = debugState.manualPwmEnabled ? debugState.manualPwmDuty * 100.0f : 0.0f;
-    setPwmDuty(debugState.manualPwmEnabled ? debugState.manualPwmDuty : 0.0f);
+    setPwmDuty(debugState.manualPwmEnabled ? debugState.manualPwmDuty : 0.0f, debugState.manualPwmEnabled);
   }
 
   savePreferences();
@@ -1458,6 +1499,8 @@ void handleNetworkPost() {
 }
 
 void handleSettingsPage() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
   server.send(200, "text/html", buildSettingsHtml());
 }
 
@@ -1471,7 +1514,12 @@ void handleConfigPost() {
 
   String message;
   if (!applyJsonConfig(doc, message)) {
-    server.send(400, "application/json", String("{\"error\":\"") + message + "\"}");
+    String rawJson;
+    JsonDocument rawDoc;
+    rawDoc.set(server.arg("plain"));
+    serializeJson(rawDoc, rawJson);
+    String payload = String("{\"error\":\"") + message + "\",\"raw\":" + rawJson + "}";
+    server.send(400, "application/json", payload);
     return;
   }
 
@@ -1618,6 +1666,8 @@ void handleAstroTemperature() {
 
 void handleRoot() {
   if (captivePortalActive && !WiFi.isConnected()) {
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    server.sendHeader("Pragma", "no-cache");
     server.send(200, "text/html", buildPortalHtml());
     return;
   }
@@ -1653,19 +1703,19 @@ void handleRoot() {
   html += F("<div class='card wide'><h2>Grafici</h2><div class='chartWrap'><div class='chartLegend'><div class='legendItem'><span class='sw' style='background:#55d6ff'></span><span>Lato freddo</span></div><div class='legendItem hotOnly'><span class='sw' style='background:#ff8f6b'></span><span>Lato caldo</span></div><div class='legendItem'><span class='sw' style='background:#6ee7b7'></span><span>Ambiente</span></div><div class='legendItem'><span class='sw' style='background:#3a86ff'></span><span>Potenza Peltier</span></div><div class='chartControls'><span>Scala</span><select id='chart_window'><option value='900'>15 min</option><option value='3600'>1 ora</option><option value='14400' selected>4 ore</option><option value='43200'>12 ore</option></select></div></div><canvas id='trendChart' width='1000' height='240'></canvas></div></div>");
   html += F("<div class='card'><h2>Controllo</h2><div class='row'><div><label title='Setpoint richiesto per il lato freddo'>Target freddo</label><div class='uf'><input id='target_c' type='number' step='0.1' title='Setpoint richiesto per il lato freddo'><span>°C</span></div></div><div><label title='Margine minimo di sicurezza sopra il dew point'>Margine dewp</label><div class='uf'><input id='dew_margin_c' type='number' step='0.1' title='Margine minimo di sicurezza sopra il dew point'><span>°C</span></div></div></div><div class='row'><div><label title='Limite massimo normalizzato del duty PWM della Peltier'>Duty max</label><div class='uf'><input id='max_duty' type='number' step='0.01' min='0' max='1' title='Limite massimo normalizzato del duty PWM della Peltier'><span>x</span></div></div><div class='hotOnly'><label title='Soglia di spegnimento per protezione lato caldo'>T. max caldo</label><div class='uf'><input id='max_hot_side_c' type='number' step='0.1' title='Soglia di spegnimento per protezione lato caldo'><span>°C</span></div></div></div><div class='row'><div><label title='Abilita o disabilita il raffreddamento in anello chiuso'>Controllo</label><select id='enabled' title='Abilita o disabilita il raffreddamento in anello chiuso'><option value='true'>Abilitato</option><option value='false'>Disabilitato</option></select></div><div></div></div><div class='actions'><div><button onclick='saveConfig()' title='Salva i parametri di controllo correnti'>Salva controllo</button></div><div class='right'><button class='warn' onclick='disableCooler()' title='Ferma immediatamente l uscita verso la Peltier'>Stop</button></div></div></div>");
   html += F("<div class='card'><h2>PID</h2><div class='row'><div><label>Kp</label><input id='kp' type='number' step='0.01'></div><div><label>Ki</label><input id='ki' type='number' step='0.01'></div></div><div class='row'><div><label>Kd</label><input id='kd' type='number' step='0.01'></div><div><label>Profilo rapido</label><select id='pid_profile'><option value='manual'>Manuale</option><option value='soft'>Soft</option><option value='normal'>Normal</option><option value='aggressive'>Aggressive</option></select></div></div><div class='actions'><div><button class='alt' onclick='applyBaseTune()'>Calibrazione PID</button></div><div class='right'><button onclick='savePid()'>Salva PID</button></div></div></div>");
-  html += F("<div class='card'><h2>Calibrazioni</h2><div class='row'><div><label>Offset freddo</label><div class='uf'><input id='cold_offset_c' type='number' step='0.1'><span>°C</span></div></div><div><label>Offset caldo</label><div class='uf'><input id='hot_offset_c' type='number' step='0.1'><span>°C</span></div></div></div><div class='row'><div><label>Offset ambiente</label><div class='uf'><input id='ambient_offset_c' type='number' step='0.1'><span>°C</span></div></div><div><label>Offset umidita</label><div class='uf'><input id='humidity_offset_pct' type='number' step='0.1'><span>%</span></div></div></div><div class='row'><div><label>Offset corrente</label><div class='uf'><input id='current_offset_a' type='number' step='0.01'><span>A</span></div></div><div><label>Scala corrente</label><div class='uf'><input id='current_scale' type='number' step='0.01'><span>x</span></div></div></div><div class='actions'><div><button onclick='saveCalibration()'>Salva calibrazioni</button></div><div></div></div></div>");
+  html += F("<div class='card'><h2>Calibrazioni</h2><div class='row'><div><label>Offset freddo</label><div class='uf'><input id='cold_offset_c' type='text' inputmode='decimal' placeholder='-5 .. 5'><span>°C</span></div></div><div><label>Offset caldo</label><div class='uf'><input id='hot_offset_c' type='text' inputmode='decimal' placeholder='-5 .. 5'><span>°C</span></div></div></div><div class='row'><div><label>Offset ambiente</label><div class='uf'><input id='ambient_offset_c' type='text' inputmode='decimal' placeholder='-5 .. 5'><span>°C</span></div></div><div><label>Offset umidita</label><div class='uf'><input id='humidity_offset_pct' type='text' inputmode='decimal' placeholder='-10 .. 10'><span>%</span></div></div></div><div class='row'><div><label>Offset corrente</label><div class='uf'><input id='current_offset_a' type='text' inputmode='decimal' placeholder='es. 0.00'><span>A</span></div></div><div><label>Scala corrente</label><div class='uf'><input id='current_scale' type='text' inputmode='decimal' placeholder='es. 1.00'><span>x</span></div></div></div><div class='actions'><div><button onclick='saveCalibration()'>Salva calibrazioni</button></div><div></div></div></div>");
   html += F("<div class='card'><h2>Preimpostazioni</h2><label title='Profili operativi salvati'>Preset</label><select id='preset_name' title='Profili operativi salvati'><option value='estate'>Estate</option><option value='inverno'>Inverno</option><option value='deep_cooling'>Deep cooling</option></select><div class='mini' id='presetInfo' style='margin-top:18px;display:grid;grid-template-columns:1fr auto;gap:8px 18px'><div>Target</div><div>--</div><div>Dew margin</div><div>--</div><div>Duty max</div><div>--</div></div><div class='actions'><div><button onclick='applyPreset()' title='Carica la preimpostazione selezionata nella configurazione attiva'>Applica preset</button></div><div class='right'><button class='alt' onclick='savePreset()' title='Sovrascrive la preimpostazione selezionata con la configurazione attuale'>Salva preset corrente</button></div></div></div>");
   html += F("<div class='card'><h2>Statistiche</h2><div class='mini diag'><div>WiFi signal</div><div id='wifiRssi'>--</div><div>BSSID</div><div id='wifiBssid'>--</div><div>IP</div><div id='boardIp'>--</div><div>BLE</div><div id='bleState'>--</div><div>Free RAM</div><div id='freeHeap'>--</div><div>CPU temp</div><div id='cpuTemp'>--</div><div>Avvio</div><div id='bootTime'>--</div><div>I2C scan</div><div id='i2cScan'>--</div></div></div>");
   html += F("<div class='card wide'><h2>Debug</h2><div class='row'><div><label>Override PWM manuale</label><select id='debug_manual_pwm_enabled'><option value='false'>Disabilitato</option><option value='true'>Abilitato</option></select></div><div><label>Duty manuale</label><div class='uf'><input id='debug_manual_pwm_pct' type='number' step='1' min='0' max='100'><span>%</span></div></div></div><div class='actions'><div><button class='warn' onclick='applyDebugPwm()'>Applica PWM manuale</button><button class='alt' onclick='stopDebugPwm()'>Disattiva debug PWM</button><button class='alt' onclick='resetDebugMinMax()'>Reset min/max temp</button></div><div class='right mini'>Runtime only: non salvato in flash. La protezione lato caldo resta attiva.</div></div><div class='mini diag' style='margin-top:12px'><div>PWM manuale attivo</div><div id='debugManualState'>--</div><div>Duty manuale impostato</div><div id='debugManualDuty'>--</div><div>PWM realmente applicato</div><div id='debugAppliedPwm'>--</div></div><div class='mini debugDiag' id='debugReadings' style='margin-top:14px'></div></div>");
-  html += F("<script>function fmt(v,u=''){const n=Number(v);return Number.isFinite(n)?n.toFixed(2)+u:'--'}function boolVal(id){return document.getElementById(id).value==='true'}function numVal(id){return parseFloat(document.getElementById(id).value)}"
-            "const HIST_MAX=2160;const HIST_STEP_S=20;const hist={cold:[],hot:[],ambient:[],power:[],t:[]};let lastHistS=-999;let chartGeom=null;let hotEnabled=false;let chartWindowS=14400;function pushHistSample(j){const nowS=Math.floor((j.board.uptime_s||0));if(nowS-lastHistS<HIST_STEP_S&&hist.t.length)return;lastHistS=nowS;const map={cold:j.sensor.cold_c,hot:j.sensor.hot_c,ambient:j.sensor.ambient_c,power:j.control.pwm_duty*100,t:nowS};Object.keys(map).forEach(k=>{hist[k].push(Number(map[k]));if(hist[k].length>HIST_MAX)hist[k].shift()})}function fillField(id,v){const el=document.getElementById(id);const n=Number(v);if(el&&Number.isFinite(n))el.value=n}function fillBool(id,v){const el=document.getElementById(id);if(el)el.value=v?'true':'false'}function setHotVisibility(on){hotEnabled=!!on;document.querySelectorAll('.hotOnly').forEach(el=>el.style.display=hotEnabled?'':'none')}"
-            "async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});return await r.json()}"
+  html += F("<script>function fmt(v,u=''){const n=Number(v);return Number.isFinite(n)?n.toFixed(2)+u:'--'}function boolVal(id){return document.getElementById(id).value==='true'}function numVal(id){const el=document.getElementById(id);if(!el)return NaN;const raw=String(el.value||'').trim().replace(',','.');return raw===''?NaN:Number(raw)}"
+            "const HIST_MAX=2160;const HIST_STEP_S=20;const hist={cold:[],hot:[],ambient:[],power:[],t:[]};let lastHistS=-999;let chartGeom=null;let hotEnabled=false;let chartWindowS=14400;let suspendRefresh=false;let refreshSeq=0;const dirtyFields=new Set();function pushHistSample(j){const nowS=Math.floor((j.board.uptime_s||0));if(nowS-lastHistS<HIST_STEP_S&&hist.t.length)return;lastHistS=nowS;const map={cold:j.sensor.cold_c,hot:j.sensor.hot_c,ambient:j.sensor.ambient_c,power:j.control.pwm_duty*100,t:nowS};Object.keys(map).forEach(k=>{hist[k].push(Number(map[k]));if(hist[k].length>HIST_MAX)hist[k].shift()})}function fillField(id,v){const el=document.getElementById(id);const n=Number(v);if(el&&Number.isFinite(n)&&document.activeElement!==el&&!dirtyFields.has(id))el.value=n}function fillBool(id,v){const el=document.getElementById(id);if(el&&document.activeElement!==el&&!dirtyFields.has(id))el.value=v?'true':'false'}function markDirty(id){dirtyFields.add(id)}function clearDirty(ids){ids.forEach(id=>dirtyFields.delete(id))}function setHotVisibility(on){hotEnabled=!!on;document.querySelectorAll('.hotOnly').forEach(el=>el.style.display=hotEnabled?'':'none')}"
+            "async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const data=await r.json();if(!r.ok){throw new Error((data&&data.error?data.error:('HTTP '+r.status))+(data&&data.raw?(' | raw: '+data.raw):''))}return data}"
             "function drawLine(ctx,data,minV,maxV,color,left,top,bottom,w){if(data.length<2)return;ctx.beginPath();ctx.lineWidth=2.2;ctx.strokeStyle=color;data.forEach((v,i)=>{const px=left+(i/Math.max(data.length-1,1))*w;const py=bottom-((v-minV)/Math.max(maxV-minV,0.001))*(bottom-top);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py)});ctx.stroke()}function redrawCharts(){const c=document.getElementById('trendChart');const x=c.getContext('2d');const left=46,right=46,top=14,bottom=c.height-26,w=c.width-left-right;chartGeom={left,right,top,bottom,w};x.clearRect(0,0,c.width,c.height);const tMin=0;const tMax=40;for(let i=0;i<5;i++){const y=top+i*((bottom-top)/4);x.strokeStyle='#223754';x.lineWidth=1;x.beginPath();x.moveTo(left,y);x.lineTo(c.width-right,y);x.stroke();const tVal=(tMax-((tMax-tMin)/4)*i).toFixed(0);x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText(tVal,4,y+4);const pVal=(100-25*i).toFixed(0);x.fillText(pVal,c.width-right+8,y+4)}for(let h=0;h<=4;h++){const px=left+(h/4)*w;x.strokeStyle='#1a2740';x.beginPath();x.moveTo(px,top);x.lineTo(px,bottom);x.stroke();x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText(`-${4-h}h`,Math.max(px-10,2),c.height-6)}x.strokeStyle='#3b4f73';x.beginPath();x.moveTo(left,top);x.lineTo(left,bottom);x.lineTo(c.width-right,bottom);x.lineTo(c.width-right,top);x.stroke();drawLine(x,hist.cold,tMin,tMax,'#55d6ff',left,top,bottom,w);if(hotEnabled){drawLine(x,hist.hot,tMin,tMax,'#ff8f6b',left,top,bottom,w)}drawLine(x,hist.ambient,tMin,tMax,'#6ee7b7',left,top,bottom,w);drawLine(x,hist.power,0,100,'#3a86ff',left,top,bottom,w)}function syncUi(j){coldMetric.textContent=fmt(j.sensor.cold_c,' °C');dewMetric.textContent=fmt(j.sensor.dew_point_c,' °C');currentMetric.textContent=fmt(j.sensor.current_a,' A');hotMetric.textContent=fmt(j.sensor.hot_c,' °C');ambientMetric.textContent=fmt(j.sensor.ambient_c,' °C');dutyMetric.textContent=fmt(j.control.pwm_duty*100,' %');fwVersion.textContent=j.board.firmware_version||'--';projectLink.href=j.board.project_url||'#';projectLink.textContent=j.board.project_url||'--';boardIp.textContent=j.network.ip||'--';wifiRssi.textContent=Number.isFinite(j.board.wifi_rssi_dbm)?j.board.wifi_rssi_dbm+' dBm':'--';wifiBssid.textContent=j.board.wifi_bssid||'--';bleState.textContent=j.board.ble_connected?('Connected '+j.board.ble_clients):'Idle';freeHeap.textContent=Number.isFinite(j.board.free_heap_bytes)?j.board.free_heap_bytes+' B':'--';cpuTemp.textContent=fmt(j.board.cpu_temp_c,' °C');bootTime.textContent=j.board.boot_time_local||'--';syncDebugUi(j);setHotVisibility(!!j.control.hot_sensor_enabled);pushHistSample(j);redrawCharts();"
             "fillField('target_c',j.control.target_c);fillField('dew_margin_c',j.control.dew_margin_c);fillField('max_duty',j.control.max_duty);fillField('max_hot_side_c',j.control.max_hot_side_c);fillBool('enabled',j.control.enabled);fillBool('hot_sensor_enabled',j.control.hot_sensor_enabled);"
             "fillField('kp',j.pid.kp);fillField('ki',j.pid.ki);fillField('kd',j.pid.kd);document.getElementById('pid_profile').value=['soft','normal','aggressive'].includes(j.pid.profile)?j.pid.profile:'manual';"
             "fillField('cold_offset_c',j.calibration.cold_offset_c);fillField('hot_offset_c',j.calibration.hot_offset_c);fillField('ambient_offset_c',j.calibration.ambient_offset_c);fillField('humidity_offset_pct',j.calibration.humidity_offset_pct);fillField('current_offset_a',j.calibration.current_offset_a);fillField('current_scale',j.calibration.current_scale);const p=document.getElementById('preset_name').value;const pr=j.presets&&j.presets[p]?j.presets[p]:null;document.getElementById('presetInfo').innerHTML=pr?`<div>Target</div><div>${fmt(pr.target_c,' °C')}</div><div>Dew margin</div><div>${fmt(pr.dew_margin_c,' °C')}</div><div>Duty max</div><div>${fmt(pr.max_duty*100,' %')}</div>`:'<div>Preset</div><div>non disponibile</div>'}"
             "function syncDebugUi(j){const en=document.getElementById('debug_manual_pwm_enabled');const pct=document.getElementById('debug_manual_pwm_pct');if(document.activeElement!==en){en.value=j.debug.manual_pwm_enabled?'true':'false'}if(document.activeElement!==pct){pct.value=Number.isFinite(Number(j.debug.manual_pwm_pct))?Number(j.debug.manual_pwm_pct).toFixed(0):0}debugManualState.textContent=j.debug.manual_pwm_enabled?'abilitato':'disabilitato';debugManualDuty.textContent=fmt(j.debug.manual_pwm_pct,' %');debugAppliedPwm.textContent=fmt(j.control.pwm_duty*100,' %');const i2c=document.getElementById('i2cScan');if(i2c){i2c.textContent=j.debug.i2c_scan||'--'}const s=j.sensor;const rows=[['NTC filtro alpha',j.debug.temperature_filter_alpha],['Campioni ADC',j.debug.adc_sample_count],['Freddo min/max',fmt(j.debug.cold_min_c,' °C')+' / '+fmt(j.debug.cold_max_c,' °C')],['Caldo min/max',fmt(j.debug.hot_min_c,' °C')+' / '+fmt(j.debug.hot_max_c,' °C')],['Freddo raw C',fmt(s.cold_raw_c,' °C')],['Freddo filtrato C',fmt(s.cold_c,' °C')],['Freddo trend',fmt(j.debug.cold_trend_c_per_min,' °C/min')],['Caldo raw C',fmt(s.hot_raw_c,' °C')],['Caldo filtrato C',fmt(s.hot_c,' °C')],['Caldo trend',fmt(j.debug.hot_trend_c_per_min,' °C/min')],['Potenza trend Peltier',fmt(j.debug.peltier_trend_power_pct,' %')],['NTC freddo raw',s.cold_ntc_raw],['NTC freddo V',fmt(s.cold_ntc_voltage_v,' V')],['NTC freddo ohm',fmt(s.cold_ntc_ohm,' ohm')],['NTC caldo raw',s.hot_ntc_raw],['NTC caldo V',fmt(s.hot_ntc_voltage_v,' V')],['NTC caldo ohm',fmt(s.hot_ntc_ohm,' ohm')],['ADC corrente raw',s.adc32_raw],['ADC corrente V',fmt(s.adc32_voltage_v,' V')],['BME280 ok',s.bme280_ok?'si':'no'],['Ambiente',fmt(s.ambient_c,' °C')],['Umidita',fmt(s.humidity_pct,' %')],['Dew point',fmt(s.dew_point_c,' °C')],['INA219 ok',s.ina219_ok?'si':'no'],['Corrente',fmt(s.current_a,' A')],['Bus Peltier',fmt(s.bus_voltage_v,' V')],['Hot protection',j.control.hot_protection_active?'attiva':'no'],['Dew clamp',j.control.dew_clamp_active?'attivo':'no']];document.getElementById('debugReadings').innerHTML=rows.map(r=>`<div class='debugPair'><span>${r[0]}</span><span>${r[1]}</span></div>`).join('')}"
-            "async function refreshStatus(){syncUi(await api('/api/status'))}"
+            "async function refreshStatus(){if(suspendRefresh)return;const seq=++refreshSeq;try{const data=await api('/api/status');if(seq===refreshSeq&&!suspendRefresh)syncUi(data)}catch(e){console.error(e)}}"
             "async function saveConfig(){syncUi(await api('/api/config',{enabled:boolVal('enabled'),target_c:numVal('target_c'),dew_margin_c:numVal('dew_margin_c'),max_duty:numVal('max_duty'),max_hot_side_c:numVal('max_hot_side_c')}))}"
             "async function applyDebugPwm(){const en=boolVal('debug_manual_pwm_enabled');const pct=numVal('debug_manual_pwm_pct');syncUi(await api('/api/config',{manual_pwm_enabled:en,manual_pwm_pct:pct,debug:{manual_pwm_enabled:en,manual_pwm_pct:pct}}))}"
             "async function stopDebugPwm(){document.getElementById('debug_manual_pwm_enabled').value='false';document.getElementById('debug_manual_pwm_pct').value='0';syncUi(await api('/api/config',{manual_pwm_enabled:false,manual_pwm_pct:0,debug:{manual_pwm_enabled:false,manual_pwm_pct:0}}))}"
@@ -1674,14 +1724,16 @@ void handleRoot() {
             "async function savePid(){syncUi(await api('/api/config',{pid:{kp:numVal('kp'),ki:numVal('ki'),kd:numVal('kd')}}))}"
             "async function savePidProfile(){syncUi(await api('/api/config',{pid_profile:document.getElementById('pid_profile').value}))}"
             "async function applyBaseTune(){syncUi(await api('/api/pid/base-tune',{}))}"
-            "async function saveCalibration(){syncUi(await api('/api/config',{calibration:{cold_offset_c:numVal('cold_offset_c'),hot_offset_c:numVal('hot_offset_c'),ambient_offset_c:numVal('ambient_offset_c'),humidity_offset_pct:numVal('humidity_offset_pct'),current_offset_a:numVal('current_offset_a'),current_scale:numVal('current_scale')}}))}"
+            "async function saveCalibration(){const ids=['cold_offset_c','hot_offset_c','ambient_offset_c','humidity_offset_pct','current_offset_a','current_scale'];const calibration={};ids.forEach(id=>{const el=document.getElementById(id);if(!el)return;const raw=String(el.value||'').trim();if(raw!==''){const key={cold_offset_c:'cold_offset_c',hot_offset_c:'hot_offset_c',ambient_offset_c:'ambient_offset_c',humidity_offset_pct:'humidity_offset_pct',current_offset_a:'current_offset_a',current_scale:'current_scale'}[id];calibration[key]=raw}});if(!Object.keys(calibration).length){alert('Nessun valore valido da salvare');return}const requestBody={calibration};suspendRefresh=true;try{const res=await api('/api/config',requestBody);clearDirty(ids);syncUi(res)}catch(e){alert('Salvataggio calibrazioni fallito: '+e.message+' | payload: '+JSON.stringify(requestBody))}finally{suspendRefresh=false}}"
             "async function applyPreset(){syncUi(await api('/api/preset/apply',{name:document.getElementById('preset_name').value}))}"
             "async function savePreset(){syncUi(await api('/api/preset/save',{name:document.getElementById('preset_name').value}))}document.getElementById('preset_name').addEventListener('change',refreshStatus);document.getElementById('pid_profile').addEventListener('change',savePidProfile);"
             "refreshStatus();setInterval(refreshStatus,2000);</script><script>"
             "function drawLine(ctx,data,minV,maxV,color,left,top,bottom,w){if(data.length<2)return;ctx.beginPath();ctx.lineWidth=2.2;ctx.strokeStyle=color;let started=false;data.forEach((v,i)=>{if(!Number.isFinite(v)){started=false;return}const px=left+(i/Math.max(data.length-1,1))*w;const py=bottom-((v-minV)/Math.max(maxV-minV,0.001))*(bottom-top);if(!started){ctx.moveTo(px,py);started=true}else ctx.lineTo(px,py)});ctx.stroke()}"
             "function timeLabel(s){return s>=3600?Math.round(s/3600)+'h':Math.round(s/60)+'m'}function chartView(k,idx){return idx.map(i=>hist[k][i])}"
             "function redrawCharts(){const c=document.getElementById('trendChart');const x=c.getContext('2d');const left=46,right=46,top=14,bottom=c.height-26,w=c.width-left-right;chartGeom={left,right,top,bottom,w};x.clearRect(0,0,c.width,c.height);const latest=hist.t.length?hist.t[hist.t.length-1]:0;const from=latest-chartWindowS;const idx=hist.t.map((t,i)=>t>=from?i:-1).filter(i=>i>=0);const cold=chartView('cold',idx),hot=chartView('hot',idx),ambient=chartView('ambient',idx),power=chartView('power',idx);const tMin=0;const tMax=40;for(let i=0;i<5;i++){const y=top+i*((bottom-top)/4);x.strokeStyle='#223754';x.lineWidth=1;x.beginPath();x.moveTo(left,y);x.lineTo(c.width-right,y);x.stroke();const tVal=(tMax-((tMax-tMin)/4)*i).toFixed(0);x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText(tVal,4,y+4);const pVal=(100-25*i).toFixed(0);x.fillText(pVal,c.width-right+8,y+4)}for(let h=0;h<=4;h++){const px=left+(h/4)*w;x.strokeStyle='#1a2740';x.beginPath();x.moveTo(px,top);x.lineTo(px,bottom);x.stroke();x.fillStyle='#9fb5d8';x.font='11px Arial';x.fillText('-'+timeLabel(chartWindowS*(1-h/4)),Math.max(px-14,2),c.height-6)}x.strokeStyle='#3b4f73';x.beginPath();x.moveTo(left,top);x.lineTo(left,bottom);x.lineTo(c.width-right,bottom);x.lineTo(c.width-right,top);x.stroke();drawLine(x,cold,tMin,tMax,'#55d6ff',left,top,bottom,w);if(hotEnabled){drawLine(x,hot,tMin,tMax,'#ff8f6b',left,top,bottom,w)}drawLine(x,ambient,tMin,tMax,'#6ee7b7',left,top,bottom,w);drawLine(x,power,0,100,'#3a86ff',left,top,bottom,w)}"
-            "document.getElementById('chart_window').addEventListener('change',e=>{chartWindowS=Number(e.target.value);redrawCharts();refreshStatus()});</script></div></body></html>");
+            "document.getElementById('chart_window').addEventListener('change',e=>{chartWindowS=Number(e.target.value);redrawCharts();refreshStatus()});['cold_offset_c','hot_offset_c','ambient_offset_c','humidity_offset_pct','current_offset_a','current_scale','target_c','dew_margin_c','max_duty','max_hot_side_c','kp','ki','kd','debug_manual_pwm_pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.addEventListener('input',()=>markDirty(id))}});['enabled','hot_sensor_enabled','pid_profile','preset_name','debug_manual_pwm_enabled'].forEach(id=>{const el=document.getElementById(id);if(el){el.addEventListener('change',()=>markDirty(id))}});</script></div></body></html>");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
   server.send(200, "text/html", html);
 }
 

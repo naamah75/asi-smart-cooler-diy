@@ -130,7 +130,7 @@ La versione `LOLIN S2 Pico` usa l'ADC interno dell'ESP32-S2. Con attenuazione `A
 
 Parametri attuali in `platformio.ini` per `lolin_s2_pico_espadc_ina219`:
 
-- `NTC_SERIES_RESISTOR_OHM=9890.0f`: resistenza reale del partitore misurata, `9.89 kOhm`
+- `NTC_SERIES_RESISTOR_OHM=9630.0f`: resistenza reale del partitore misurata, `9.63 kOhm`
 - `NTC_SUPPLY_VOLTAGE=3.28f`: tensione reale tra `3V3` e `GND`
 - `NTC_ADC_FULL_SCALE_V=2.50f`: scala ADC raw ESP32-S2 a `ADC_11db`
 - `NTC_COLD_TEMP_OFFSET_C=0.0f`: offset temperatura sonda fredda
@@ -140,7 +140,7 @@ Misure di riferimento usate per la taratura iniziale:
 
 - tensione `3V3-GND`: `3.28V`
 - tensione `ADC NTC-GND`: `1.635V`
-- resistenza fissa partitore: `9.89 kOhm`
+- resistenza fissa partitore: `9.63 kOhm`
 
 La formula del partitore e:
 
